@@ -33,10 +33,20 @@ dp = Dispatcher()
 def init_db():
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
+    # Таблица пользователей
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
             user_id INTEGER PRIMARY KEY,
             cities TEXT
+        )
+    """)
+    # Таблица истории цен на топливо
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fuel_history (
+            date TEXT PRIMARY KEY,
+            ai92 REAL,
+            ai95 REAL,
+            dt REAL
         )
     """)
     conn.commit()
@@ -70,35 +80,109 @@ def get_subscribers() -> list:
     conn.close()
     return [row[0] for row in rows]
 
+def get_yesterday_fuel():
+    """Берет последнюю сохраненную запись о ценах (вчерашнюю или более раннюю)"""
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT ai92, ai95, dt FROM fuel_history ORDER BY date DESC LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"АИ-92": row[0], "АИ-95": row[1], "ДТ": row[2]}
+    return None
+
+def save_today_fuel(ai92, ai95, dt):
+    """Сохраняет сегодняшние цены, чтобы завтра было с чем сравнивать"""
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO fuel_history (date, ai92, ai95, dt) VALUES (?, ?, ?, ?)
+    """, (today, ai92, ai95, dt))
+    conn.commit()
+    conn.close()
+
 init_db()
 
-# --- Список городов Ивановской области ---
+# --- Список городов ---
 REGION_CITIES = {
-    "Иваново": (56.9972, 40.9714),
-    "Шуя": (56.8487, 41.3883),
-    "Кинешма": (57.4391, 42.1289),
-    "Вичуга": (57.2128, 41.9301),
-    "Тейково": (56.858, 40.5369),
-    "Фурманов": (57.2536, 41.1085),
-    "Кохма": (56.9349, 41.0915),
-    "Родники": (57.1051, 41.7305),
-    "Приволжск": (57.387, 41.2867),
-    "Заволжск": (57.4823, 42.1378),
-    "Наволоки": (57.4657, 41.9634),
-    "Юрьевец": (57.3201, 43.1041),
-    "Южа": (56.5831, 42.0122),
-    "Гаврилов Посад": (56.5585, 40.1217),
-    "Комсомольск": (57.0292, 40.3787),
-    "Плес": (57.4606, 41.5158),
-    "Пучеж": (56.9833, 43.1667),
+    "Иваново": (56.9972, 40.9714), "Шуя": (56.8487, 41.3883), "Кинешма": (57.4391, 42.1289),
+    "Вичуга": (57.2128, 41.9301), "Тейково": (56.858, 40.5369), "Фурманов": (57.2536, 41.1085),
+    "Кохма": (56.9349, 41.0915), "Родники": (57.1051, 41.7305), "Приволжск": (57.387, 41.2867),
+    "Заволжск": (57.4823, 42.1378), "Наволоки": (57.4657, 41.9634), "Юрьевец": (57.3201, 43.1041),
+    "Южа": (56.5831, 42.0122), "Гаврилов Посад": (56.5585, 40.1217), "Комсомольск": (57.0292, 40.3787),
+    "Плес": (57.4606, 41.5158), "Пучеж": (56.9833, 43.1667),
 }
-
-# Ближайшие спутники Иваново
 IVANOVO_AGGLOMERATION = ["Иваново", "Кохма", "Тейково", "Фурманов", "Шуя", "Приволжск"]
 
 class RouteState(StatesGroup):
     waiting_for_start = State()
     waiting_for_end = State()
+
+# --- Получение цен на бензин ---
+def format_price_with_delta(name, current, previous):
+    """Форматирует цену со стрелочкой и процентом"""
+    if not previous or current is None:
+        return f"🔹 <b>{name}:</b> {current} ₽/л\n" if current else ""
+    
+    diff = current - previous
+    percent = (diff / previous) * 100
+    
+    if diff > 0:
+        return f"🔹 <b>{name}:</b> {current} ₽/л 📈 <i>(+{percent:.2f}%)</i>\n"
+    elif diff < 0:
+        return f"🔹 <b>{name}:</b> {current} ₽/л 📉 <i>({percent:.2f}%)</i>\n"
+    else:
+        return f"🔹 <b>{name}:</b> {current} ₽/л ➡️ <i>(0%)</i>\n"
+
+async def get_fuel_prices(show_delta=False):
+    url = "https://benzokolonka.com/api/home?region=38"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    return "⚠️ Не удалось получить данные о ценах на топливо."
+                data = await resp.json()
+                
+                fuel_cards = data.get("fuelCards", [])
+                prices = {}
+                for card in fuel_cards:
+                    if card["fuelCode"] == "ai92": prices["АИ-92"] = float(card.get("price"))
+                    elif card["fuelCode"] == "ai95": prices["АИ-95"] = float(card.get("price"))
+                    elif card["fuelCode"] == "dt": prices["ДТ"] = float(card.get("price"))
+                
+                if not prices:
+                    return "⚠️ Цены на топливо временно недоступны."
+
+                text = "⛽ <b>Средние цены на топливо (Ивановская обл.):</b>\n\n"
+                
+                if show_delta:
+                    yesterday_prices = get_yesterday_fuel()
+                    if yesterday_prices:
+                        text += format_price_with_delta("АИ-92", prices.get("АИ-92"), yesterday_prices.get("АИ-92"))
+                        text += format_price_with_delta("АИ-95", prices.get("АИ-95"), yesterday_prices.get("АИ-95"))
+                        text += format_price_with_delta("ДТ", prices.get("ДТ"), yesterday_prices.get("ДТ"))
+                    else:
+                        # Если истории еще нет (первый запуск)
+                        text += f"🔹 <b>АИ-92:</b> {prices.get('АИ-92')} ₽/л\n"
+                        text += f"🔹 <b>АИ-95:</b> {prices.get('АИ-95')} ₽/л\n"
+                        text += f"🔹 <b>ДТ:</b> {prices.get('ДТ')} ₽/л\n"
+                    
+                    # Сохраняем сегодняшние цены в историю для завтрашнего сравнения
+                    save_today_fuel(prices.get("АИ-92"), prices.get("АИ-95"), prices.get("ДТ"))
+                else:
+                    # Обычный вывод без сравнения (для команды /fuel)
+                    if "АИ-92" in prices: text += f"🔹 <b>АИ-92:</b> {prices['АИ-92']} ₽/л\n"
+                    if "АИ-95" in prices: text += f"🔹 <b>АИ-95:</b> {prices['АИ-95']} ₽/л\n"
+                    if "ДТ" in prices: text += f"🔹 <b>ДТ:</b> {prices['ДТ']} ₽/л\n"
+
+                text += "\n<i>Данные обновляются автоматически.</i>"
+                return text
+        except Exception as e:
+            print(f"Ошибка топлива: {e}")
+            return "⚠️ Ошибка при запросе цен на топливо."
 
 # --- Погода ---
 def get_weather_emoji(code):
@@ -125,18 +209,21 @@ async def get_region_weather(user_cities: list):
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=10) as resp:
-                if resp.status != 200: return "⚠️ Ошибка получения погоды."
+                if resp.status != 200: return f"⚠️ Ошибка сервера погоды (Код: {resp.status})."
                 data = await resp.json()
+                if isinstance(data, dict): data = [data]
+
                 lines = []
                 for i, city in enumerate(selected_cities.keys()):
                     if i < len(data):
-                        current = data[i]["current"]
+                        current = data[i].get("current", {})
                         temp = current.get("temperature_2m", 0)
                         prob = current.get("precipitation_probability", 0)
                         code = current.get("weather_code", 0)
                         lines.append(f"{get_weather_emoji(code)} <b>{city}</b>: {temp:+.0f}°C, 💧{prob}%")
                 return "🌍 <b>Погода в выбранных городах:</b>\n" + "\n".join(lines)
-        except Exception:
+        except Exception as e:
+            print(f"Ошибка региона: {e}")
             return "⚠️ Ошибка при запросе к сервису."
 
 def get_road_condition(temp, desc, wind):
@@ -227,7 +314,7 @@ def extract_street(text):
 def infer_traffic_impact(text):
     lower = text.lower()
     if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет"]):
-        return "🔴 <b>Высокое</b>. Возможна серьезная пробка.", True # is_high
+        return "🔴 <b>Высокое</b>. Возможна серьезная пробка.", True
     elif any(w in lower for w in ["дтп", "авария", "столкновение", "пострадал", "скорая", "затор"]):
         return "🟠 <b>Среднее</b>. Движение замедлено.", False
     else:
@@ -322,29 +409,24 @@ async def get_traffic_summary(is_bad_weather, user_cities):
         if not any(len(words_new.intersection(set(w.strip(".,!?\"'()-") for w in ex["title"].lower().split() if len(w) > 3))) >= 2 for ex in unique_news):
             unique_news.append(news)
             
-    # Логика фильтрации по географии и важности
     filtered_news = []
     for news in unique_news:
         impact_text, is_high = infer_traffic_impact(news["title"] + " " + news["desc"])
         news["impact_text"] = impact_text
         news["is_high"] = is_high
         
-        # 1. Громкие события и трассы области — показываем ВСЕМ
         if is_high or news["city"] == "Ивановская область":
             filtered_news.append(news)
             continue
             
-        # 2. Если новость в выбранном городе — показываем
         if news["city"] in user_cities:
             filtered_news.append(news)
             continue
 
-        # 3. Ивановская агломерация (если выбран Иваново)
         if "Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION:
             filtered_news.append(news)
             continue
 
-        # 4. Новости Иваново для жителей других городов (как обл. центр)
         if "Иваново" not in user_cities and news["city"] == "Иваново":
             filtered_news.append(news)
             continue
@@ -381,13 +463,16 @@ async def morning_broadcast():
     if not subscribers: return
     
     weather_text, is_bad = await get_weather_ivanovo()
+    # Включаем сравнение цен для утренней сводки
+    fuel_text = await get_fuel_prices(show_delta=True) 
     
     for user_id in subscribers:
         user_cities = get_user_cities(user_id)
         region_text = await get_region_weather(user_cities)
         traffic_text = await get_traffic_summary(is_bad, user_cities)
         
-        full_text = f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather_text}\n\n{region_text}\n\n{traffic_text}"
+        full_text = (f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n"
+                     f"{weather_text}\n\n{region_text}\n\n{fuel_text}\n\n{traffic_text}")
         try: await bot.send_message(user_id, full_text, parse_mode="HTML")
         except Exception: pass
 
@@ -399,6 +484,7 @@ async def cmd_start(message: types.Message):
         "📋 <b>Команды:</b>\n"
         "/weather — погода в Иваново 🌤\n"
         "/region — погода в выбранных городах 🌍\n"
+        "/fuel — цены на топливо ⛽\n"
         "/settings — выбрать города ⚙️\n"
         "/traffic — ДТП и пробки 🚦\n"
         "/all — всё сразу 🗂\n"
@@ -407,6 +493,11 @@ async def cmd_start(message: types.Message):
         "/unsubscribe — отписаться 🔕",
         parse_mode="HTML"
     )
+
+@dp.message(Command("fuel"))
+async def cmd_fuel(message: types.Message):
+    # При ручном запросе показываем без дельты (чтобы не засорять базу лишними записями)
+    await message.answer(await get_fuel_prices(show_delta=False), parse_mode="HTML")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
@@ -512,8 +603,10 @@ async def cmd_all(message: types.Message):
     weather_text, is_bad = await get_weather_ivanovo()
     user_cities = get_user_cities(message.from_user.id)
     region_text = await get_region_weather(user_cities)
+    # В команде /all тоже показываем динамику
+    fuel_text = await get_fuel_prices(show_delta=True)
     traffic_text = await get_traffic_summary(is_bad, user_cities)
-    await message.answer(f"{weather_text}\n\n{region_text}\n\n{traffic_text}", parse_mode="HTML")
+    await message.answer(f"{weather_text}\n\n{region_text}\n\n{fuel_text}\n\n{traffic_text}", parse_mode="HTML")
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)

@@ -6,6 +6,11 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
+# Импорты для планировщика
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
+from datetime import datetime
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -16,6 +21,9 @@ CITY_NAME = "Иваново"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Хранилище подписчиков (в оперативной памяти, сбрасывается при перезапуске)
+SUBSCRIBERS = set()
 
 # --- Погода ---
 async def get_weather():
@@ -34,33 +42,64 @@ async def get_weather():
                     f"{desc}\n"
                     f"Ветер: {wind} м/с")
 
-# --- ДТП и заторы (парсинг новостей) ---
-async def get_accidents():
-    url = "https://newsivanovo.ru/rss"  # если RSS нет, парсим главную
+# --- ДТП и заторы (мультиисточники) ---
+async def fetch_news(session, url):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status != 200:
-                    # fallback на HTML
-                    async with session.get("https://newsivanovo.ru/") as html_resp:
-                        text = await html_resp.text()
-                else:
-                    text = await resp.text()
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        async with session.get(url, headers=headers, timeout=8) as resp:
+            if resp.status != 200:
+                return []
+            html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
+            keywords = ["дтп", "авари", "пробк", "затор", "столкновен", "перекрыт"]
+            found = []
+            # Ищем в заголовках и ссылках
+            for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
+                text = tag.get_text(strip=True)
+                if any(kw in text.lower() for kw in keywords) and len(text) > 15:
+                    found.append(text)
+            return found
     except Exception:
-        return "Не удалось получить новости о ДТП."
+        return []
 
-    soup = BeautifulSoup(text, "html.parser")
-    keywords = ["ДТП", "авари", "пробк", "затор", "столкновен"]
-    found = []
-    for item in soup.find_all(["item", "h2", "h3", "a"]):
-        title = item.get_text(strip=True)
-        if any(kw.lower() in title.lower() for kw in keywords):
-            found.append(title)
-    if not found:
+async def get_accidents():
+    # Список источников: RSS и HTML главные страницы
+    sources = [
+        "https://newsivanovo.ru/rss",
+        "https://ivanovonews.ru/rss/",
+        "https://mkivanovo.ru/",
+        "https://iv-news.ru/"
+    ]
+    
+    all_news = []
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_news(session, url) for url in sources]
+        results = await asyncio.gather(*tasks)
+        for res in results:
+            all_news.extend(res)
+            
+    if not all_news:
         return "Свежих сообщений о ДТП и заторах в Иваново не найдено."
-    # Берём последние 5 уникальных
-    unique = list(dict.fromkeys(found))[:5]
-    return "🚨 Дорожная обстановка (Иваново):\n" + "\n".join(f"— {t}" for t in unique)
+        
+    # Убираем дубликаты и ограничиваем до 7 самых свежих
+    unique_news = list(dict.fromkeys(all_news))[:7]
+    return "🚨 Дорожная обстановка (Иваново):\n" + "\n".join(f"— {t}" for t in unique_news)
+
+# --- Утренняя рассылка ---
+async def morning_broadcast():
+    if not SUBSCRIBERS:
+        return
+    
+    weather = await get_weather()
+    traffic = await get_accidents()
+    text = f"☀️ Доброе утро! Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather}\n\n{traffic}"
+    
+    for chat_id in list(SUBSCRIBERS):
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            # Если пользователь заблокировал бота — удаляем из списка
+            SUBSCRIBERS.discard(chat_id)
 
 # --- Хэндлеры ---
 @dp.message(Command("start"))
@@ -70,8 +109,20 @@ async def cmd_start(message: types.Message):
         "Команды:\n"
         "/weather — погода\n"
         "/traffic — пробки и ДТП\n"
-        "/all — всё сразу"
+        "/all — всё сразу\n"
+        "/subscribe — подписаться на утреннюю сводку (05:00 МСК)\n"
+        "/unsubscribe — отписаться от рассылки"
     )
+
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(message: types.Message):
+    SUBSCRIBERS.add(message.chat.id)
+    await message.answer("✅ Вы подписаны на утреннюю сводку. Бот пришлет её завтра в 05:00 по Москве.")
+
+@dp.message(Command("unsubscribe"))
+async def cmd_unsubscribe(message: types.Message):
+    SUBSCRIBERS.discard(message.chat.id)
+    await message.answer("❌ Вы отписаны от утренней сводки.")
 
 @dp.message(Command("weather"))
 async def cmd_weather(message: types.Message):
@@ -87,10 +138,17 @@ async def cmd_all(message: types.Message):
     traffic = await get_accidents()
     await message.answer(f"{weather}\n\n{traffic}")
 
-# --- Автоматическая рассылка (опционально) ---
-# Можно добавить позже через apscheduler, если нужна утренняя сводка.
 
 async def main():
+    # Настройка планировщика (МСК)
+    moscow_tz = pytz.timezone("Europe/Moscow")
+    scheduler = AsyncIOScheduler(timezone=moscow_tz)
+    
+    # Запуск каждый день в 05:00
+    scheduler.add_job(morning_broadcast, trigger='cron', hour=5, minute=0)
+    scheduler.start()
+    
+    print("Бот запущен. Планировщик активен.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

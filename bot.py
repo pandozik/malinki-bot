@@ -35,7 +35,6 @@ async def get_weather():
             desc = data["weather"][0]["description"].capitalize()
             wind = data["wind"]["speed"]
             
-            # Подбираем эмодзи под погоду
             emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
             
             return (f"{emoji} Погода в {CITY_NAME}:\n"
@@ -44,6 +43,17 @@ async def get_weather():
                     f"💨 Ветер: {wind} м/с")
 
 # --- ДТП и заторы ---
+def is_duplicate(new_text, existing_texts):
+    """Умная проверка на дубли по пересечению важных слов"""
+    # Очищаем от знаков препинания и разбиваем на слова
+    words_new = set(w.strip(".,!?\"'()-") for w in new_text.lower().split() if len(w) > 3)
+    for existing in existing_texts:
+        words_ex = set(w.strip(".,!?\"'()-") for w in existing.lower().split() if len(w) > 3)
+        # Если совпадает 2 и более значимых слов (например, "дтп" и "погибшими"), это дубль
+        if len(words_new.intersection(words_ex)) >= 2:
+            return True
+    return False
+
 async def fetch_news(session, url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -52,14 +62,28 @@ async def fetch_news(session, url):
                 return []
             html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
-            keywords = ["дтп", "авари", "пробк", "затор", "столкновен", "перекрыт"]
-            found = []
             
+            keywords = ["дтп", "авария", "аварии", "пробка", "пробки", "затор", "столкновение", "перекрыт"]
+            # Стоп-слова, чтобы не тащить новости других регионов
+            stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
+            
+            found = []
             for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
-                text = tag.get_text(strip=True)
-                # Фильтр "воды": берем только заголовки длиной от 20 до 110 символов
-                if 20 < len(text) < 110 and any(kw in text.lower() for kw in keywords):
-                    found.append(text)
+                text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
+                lower_text = text.lower()
+                
+                # 1. Фильтр длины (20-90 символов)
+                if not (20 <= len(text) <= 90):
+                    continue
+                    
+                # 2. Есть ключевое слово?
+                if not any(kw in lower_text for kw in keywords):
+                    continue
+                    
+                # 3. Есть локальный контекст и нет стоп-слов?
+                if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
+                    if not any(sw in lower_text for sw in stop_words):
+                        found.append(text)
             return found
     except Exception:
         return []
@@ -82,19 +106,16 @@ async def get_accidents():
     if not all_news:
         return "✅ Свежих сообщений о ДТП и заторах в Иваново не найдено."
         
-    # Умная дедупликация (ищем частичные совпадения текста)
     unique_news = []
     for news in all_news:
-        # Если новость не является частью уже добавленной и наоборот
-        if not any(news.lower() in existing.lower() or existing.lower() in news.lower() for existing in unique_news):
+        if not is_duplicate(news, unique_news):
             unique_news.append(news)
             
-    # Берем только 5 самых свежих уникальных
     final_news = unique_news[:5]
     
-    text = "🚦 Дорожная обстановка (Иваново):\n"
+    text = "🚦 <b>Дорожная обстановка (Иваново):</b>\n\n"
     for item in final_news:
-        text += f"🚨 {item}\n"
+        text += f"🔴 {item}\n\n"
     return text
 
 # --- Утренняя рассылка ---
@@ -104,11 +125,11 @@ async def morning_broadcast():
     
     weather = await get_weather()
     traffic = await get_accidents()
-    text = f"🌅 Доброе утро! Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather}\n\n{traffic}"
+    text = f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather}\n\n{traffic}"
     
     for chat_id in list(SUBSCRIBERS):
         try:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, text, parse_mode="HTML")
         except Exception:
             SUBSCRIBERS.discard(chat_id)
 
@@ -117,12 +138,13 @@ async def morning_broadcast():
 async def cmd_start(message: types.Message):
     await message.answer(
         f"👋 Привет! Я слежу за погодой и дорожной обстановкой в {CITY_NAME}.\n\n"
-        "📋 Команды:\n"
-        "/weather — погода\n"
-        "/traffic — пробки и ДТП\n"
-        "/all — всё сразу\n"
-        "/subscribe — подписаться на утреннюю сводку (05:00 МСК)\n"
-        "/unsubscribe — отписаться"
+        "📋 <b>Команды:</b>\n"
+        "/weather — погода 🌤\n"
+        "/traffic — пробки и ДТП 🚦\n"
+        "/all — всё сразу 🗂\n"
+        "/subscribe — подписаться на утреннюю сводку (05:00 МСК) ⏰\n"
+        "/unsubscribe — отписаться 🔕",
+        parse_mode="HTML"
     )
 
 @dp.message(Command("subscribe"))
@@ -141,13 +163,13 @@ async def cmd_weather(message: types.Message):
 
 @dp.message(Command("traffic"))
 async def cmd_traffic(message: types.Message):
-    await message.answer(await get_accidents())
+    await message.answer(await get_accidents(), parse_mode="HTML")
 
 @dp.message(Command("all"))
 async def cmd_all(message: types.Message):
     weather = await get_weather()
     traffic = await get_accidents()
-    await message.answer(f"{weather}\n\n{traffic}")
+    await message.answer(f"{weather}\n\n{traffic}", parse_mode="HTML")
 
 
 async def main():

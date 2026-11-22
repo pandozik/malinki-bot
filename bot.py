@@ -33,27 +33,28 @@ dp = Dispatcher()
 def init_db():
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
-    # Добавляем колонку broadcast_time (время рассылки)
+    # Таблица с массивом времен рассылки (broadcast_times)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
             user_id INTEGER PRIMARY KEY, 
             cities TEXT,
-            broadcast_time TEXT
+            broadcast_times TEXT
         )
     """)
+    # Таблица истории цен
     cursor.execute("CREATE TABLE IF NOT EXISTS fuel_history (date TEXT PRIMARY KEY, ai92 REAL, ai95 REAL, dt REAL)")
     conn.commit()
     conn.close()
 
-def get_user_settings(user_id: int) -> dict:
+def get_user_cities(user_id: int) -> list:
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT cities, broadcast_time FROM user_settings WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT cities FROM user_settings WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return {"cities": json.loads(row[0]) if row[0] else ["Иваново"], "broadcast_time": row[1]}
-    return {"cities": ["Иваново"], "broadcast_time": None}
+    if row and row[0]:
+        return json.loads(row[0])
+    return ["Иваново"]
 
 def save_user_cities(user_id: int, cities: list):
     conn = sqlite3.connect("users.db")
@@ -65,23 +66,41 @@ def save_user_cities(user_id: int, cities: list):
     conn.commit()
     conn.close()
 
-def save_user_broadcast_time(user_id: int, time_str: str):
+def get_user_times(user_id: int) -> list:
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT broadcast_times FROM user_settings WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0]:
+        return json.loads(row[0])
+    return []
+
+def save_user_times(user_id: int, times_list: list):
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO user_settings (user_id, broadcast_time) VALUES (?, ?) 
-        ON CONFLICT(user_id) DO UPDATE SET broadcast_time = excluded.broadcast_time
-    """, (user_id, time_str))
+        INSERT INTO user_settings (user_id, broadcast_times) VALUES (?, ?) 
+        ON CONFLICT(user_id) DO UPDATE SET broadcast_times = excluded.broadcast_times
+    """, (user_id, json.dumps(times_list, ensure_ascii=False)))
     conn.commit()
     conn.close()
 
 def get_users_for_broadcast(current_time: str) -> list:
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM user_settings WHERE broadcast_time = ?", (current_time,))
+    cursor.execute("SELECT user_id, broadcast_times FROM user_settings")
     rows = cursor.fetchall()
     conn.close()
-    return [row[0] for row in rows]
+    
+    users = []
+    for row in rows:
+        user_id, times_json = row
+        if times_json:
+            times = json.loads(times_json)
+            if current_time in times:
+                users.append(user_id)
+    return users
 
 def get_yesterday_fuel():
     conn = sqlite3.connect("users.db")
@@ -455,7 +474,7 @@ async def get_traffic_summary(is_bad_weather, user_cities):
         text += f"🚦 <b>Влияние:</b> {news['impact_text']}\n➖➖➖➖➖➖➖➖\n"
     return text
 
-# --- Персональная рассылка ---
+# --- Множественная рассылка ---
 async def broadcast_job():
     current_time = datetime.now(MSK_TZ).strftime("%H:%M")
     users = get_users_for_broadcast(current_time)
@@ -464,18 +483,14 @@ async def broadcast_job():
     weather_text, is_bad = await get_weather_ivanovo()
     fuel_text = await get_fuel_prices(show_delta=True)
     fuel_news = await get_fuel_situation_news()
-    traffic_general = await get_traffic_summary(is_bad, ["Иваново"]) # Для общего кэша
+    traffic_general = await get_traffic_summary(is_bad, ["Иваново"]) 
 
     for user_id in users:
-        settings = get_user_settings(user_id)
-        user_cities = settings["cities"]
+        user_cities = get_user_cities(user_id)
         
-        # Формируем индивидуальный текст
-        full_text = (f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now(MSK_TZ).strftime('%d.%m.%Y')}:\n\n"
+        full_text = (f"🌅 <b>Доброе утро!</b> (или день/вечер)\n📅 Сводка на {datetime.now(MSK_TZ).strftime('%d.%m.%Y')}:\n\n"
                      f"{weather_text}\n\n{await get_region_weather(user_cities)}\n\n{fuel_text}\n\n")
         if fuel_news: full_text += f"{fuel_news}\n"
-        
-        # Для трафика делаем индивидуальный запрос, так как фильтры по городам разные
         full_text += f"{await get_traffic_summary(is_bad, user_cities)}"
         
         try: 
@@ -486,6 +501,12 @@ async def broadcast_job():
 # --- Клавиатура настроек ---
 def get_cities_keyboard(user_cities: list):
     keyboard = []
+    # Кнопки массового выбора
+    keyboard.append([
+        InlineKeyboardButton(text="✅ Выбрать ВСЕ", callback_data="select_all"),
+        InlineKeyboardButton(text="❌ Очистить", callback_data="clear_all")
+    ])
+    
     row = []
     for city in REGION_CITIES.keys():
         btn_text = f"✅ {city}" if city in user_cities else city
@@ -501,19 +522,18 @@ def get_cities_keyboard(user_cities: list):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Большое приветствие
     intro_text = (
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
         "Я — твой персональный помощник по <b>Ивановской области</b>. "
-        "Я собираю самые важные данные в одном месте, чтобы ты всегда был в курсе событий.\n\n"
+        "Я собираю самые важные данные в одном месте.\n\n"
         "📌 <b>Что я умею:</b>\n"
-        "🌤 <b>Погода</b> — точный прогноз и состояние дорог.\n"
-        "🌍 <b>Города</b> — погода в выбранных тобой городах области.\n"
-        "🚦 <b>ДТП и Заторы</b> — оперативные новости с улиц и трасс.\n"
-        "⛽ <b>Бензин</b> — цены на топливо и новости о дефиците.\n"
-        "🗺 <b>Маршрут</b> — расчет времени в пути между точками.\n\n"
-        "⚙️ <b>Настройки:</b> Выбери свои города и настрой удобное время для утренней сводки.\n\n"
-        "👇 <i>Используй кнопки меню внизу экрана для управления.</i>"
+        "🌤 <b>Погода</b> — прогноз и состояние дорог.\n"
+        "🌍 <b>Города</b> — погода в выбранных городах области.\n"
+        "🚦 <b>ДТП и Заторы</b> — оперативные новости.\n"
+        "⛽ <b>Бензин</b> — цены и новости о дефиците.\n"
+        "🗺 <b>Маршрут</b> — расчет времени в пути.\n\n"
+        "⚙️ <b>Настройки:</b> Выбери города и настрой до 3-х удобных времен для рассылки.\n\n"
+        "👇 <i>Используй кнопки меню внизу экрана.</i>"
     )
     await message.answer(intro_text, reply_markup=get_main_menu(), parse_mode="HTML")
 
@@ -523,7 +543,7 @@ async def cmd_weather(message: types.Message): await message.answer((await get_w
 
 @dp.message(F.text == "🌍 Города")
 @dp.message(Command("region"))
-async def cmd_region(message: types.Message): await message.answer(await get_region_weather(get_user_settings(message.from_user.id)["cities"]), parse_mode="HTML")
+async def cmd_region(message: types.Message): await message.answer(await get_region_weather(get_user_cities(message.from_user.id)), parse_mode="HTML")
 
 @dp.message(F.text == "⛽ Бензин")
 @dp.message(Command("fuel"))
@@ -535,7 +555,7 @@ async def cmd_fuel(message: types.Message):
 
 @dp.message(F.text == "🚦 ДТП и Заторы")
 @dp.message(Command("traffic"))
-async def cmd_traffic(message: types.Message): await message.answer(await get_traffic_summary((await get_weather_ivanovo())[1], get_user_settings(message.from_user.id)["cities"]), parse_mode="HTML")
+async def cmd_traffic(message: types.Message): await message.answer(await get_traffic_summary((await get_weather_ivanovo())[1], get_user_cities(message.from_user.id)), parse_mode="HTML")
 
 @dp.message(F.text == "🗂 Всё сразу")
 @dp.message(Command("all"))
@@ -543,24 +563,29 @@ async def cmd_all(message: types.Message):
     user_id = message.from_user.id
     weather_text, is_bad = await get_weather_ivanovo()
     fuel_news = await get_fuel_situation_news()
-    text = (f"{weather_text}\n\n{await get_region_weather(get_user_settings(user_id)['cities'])}\n\n{await get_fuel_prices(True)}\n\n")
+    text = (f"{weather_text}\n\n{await get_region_weather(get_user_cities(user_id))}\n\n{await get_fuel_prices(True)}\n\n")
     if fuel_news: text += f"{fuel_news}\n"
-    text += f"{await get_traffic_summary(is_bad, get_user_settings(user_id)['cities'])}"
+    text += f"{await get_traffic_summary(is_bad, get_user_cities(user_id))}"
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "⚙️ Настройки")
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message): 
-    await message.answer("⚙️ <b>Настройка городов</b>\nВыберите города для отслеживания:", reply_markup=get_cities_keyboard(get_user_settings(message.from_user.id)["cities"]), parse_mode="HTML")
+    await message.answer("⚙️ <b>Настройка городов</b>\nВыберите города для отслеживания (можно выбрать все):", reply_markup=get_cities_keyboard(get_user_cities(message.from_user.id)), parse_mode="HTML")
 
-# --- Настройка времени рассылки ---
+# --- Настройка времени рассылки (до 3-х слотов) ---
 @dp.message(F.text == "⏰ Время рассылки")
 async def menu_broadcast_time(message: types.Message, state: FSMContext):
-    current_time = get_user_settings(message.from_user.id)["broadcast_time"]
-    if current_time:
-        text = f"⏰ Сейчас ваша рассылка приходит в <b>{current_time}</b> (МСК).\n\nЧтобы изменить время, напишите новое в формате <code>ЧЧ:ММ</code> (например, <code>07:30</code>).\nЧтобы <b>отключить</b> рассылку, напишите <code>0</code>."
+    times = get_user_times(message.from_user.id)
+    if times:
+        times_str = ", ".join(f"<b>{t}</b>" for t in times)
+        text = f"⏰ Ваши текущие времена рассылки: {times_str} (МСК).\n\n"
     else:
-        text = "⏰ У вас пока не настроена рассылка.\n\nНапишите время в формате <code>ЧЧ:ММ</code> (например, <code>07:30</code>), и я буду присылать вам сводку каждый день в это время.\n\nЧтобы отменить, напишите <code>0</code>."
+        text = "⏰ У вас пока не настроена рассылка.\n\n"
+        
+    text += ("Вы можете добавить до <b>3-х</b> временных слотов.\n"
+             "Напишите время в формате <code>ЧЧ:ММ</code> (например, <code>07:30</code>).\n\n"
+             "Чтобы <b>удалить все</b> времена, напишите <code>0</code>.")
     
     await state.set_state(BroadcastState.waiting_for_time)
     await message.answer(text, parse_mode="HTML")
@@ -568,22 +593,36 @@ async def menu_broadcast_time(message: types.Message, state: FSMContext):
 @dp.message(BroadcastState.waiting_for_time)
 async def process_broadcast_time(message: types.Message, state: FSMContext):
     text = message.text.strip().lower()
+    user_id = message.from_user.id
     
     if text in ["0", "отмена", "стоп"]:
-        save_user_broadcast_time(message.from_user.id, None)
+        save_user_times(user_id, [])
         await state.clear()
-        await message.answer("🔕 Рассылка отключена.")
+        await message.answer("🔕 Все рассылки отключены, время очищено.")
         return
 
-    # Проверка формата ЧЧ:ММ
     if re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$', text):
-        # Приводим к формату с ведущим нулем (например, 7:30 -> 07:30)
-        if len(text) == 4: text = "0" + text
-        save_user_broadcast_time(message.from_user.id, text)
+        if len(text) == 4: text = "0" + text # 7:30 -> 07:30
+        
+        times = get_user_times(user_id)
+        
+        if len(times) >= 3:
+            await message.answer("❌ У вас уже установлено максимальное количество времен (3). Напишите <code>0</code>, чтобы очистить их, или дождитесь завтрашнего дня.", parse_mode="HTML")
+            return
+            
+        if text in times:
+            await message.answer("⚠️ Это время уже добавлено.")
+            return
+
+        times.append(text)
+        times.sort() # Сортируем по порядку
+        save_user_times(user_id, times)
         await state.clear()
-        await message.answer(f"✅ Отлично! Теперь я буду присылать вам сводку каждый день в <b>{text}</b> по Москве.", parse_mode="HTML")
+        
+        times_str = ", ".join(f"<b>{t}</b>" for t in times)
+        await message.answer(f"✅ Время <b>{text}</b> добавлено!\nТеперь ваши рассылки: {times_str}.", parse_mode="HTML")
     else:
-        await message.answer("❌ Неверный формат времени. Пожалуйста, напишите в формате <code>ЧЧ:ММ</code> (например, <code>08:00</code>) или <code>0</code> для отмены.", parse_mode="HTML")
+        await message.answer("❌ Неверный формат. Напишите <code>ЧЧ:ММ</code> (например, <code>08:00</code>) или <code>0</code> для очистки.", parse_mode="HTML")
 
 # --- Маршрут ---
 @dp.message(F.text == "🗺 Маршрут")
@@ -610,17 +649,29 @@ async def process_route_end(message: types.Message, state: FSMContext):
         if not route_data: return await wait_msg.edit_text("❌ Ошибка маршрута.")
         dist_km, base_min = route_data
     _, is_bad = await get_weather_ivanovo()
-    time_penalty = 10 if "🚨" in await get_traffic_summary(is_bad, get_user_settings(message.from_user.id)["cities"]) else 0
+    time_penalty = 10 if "🚨" in await get_traffic_summary(is_bad, get_user_cities(message.from_user.id)) else 0
     total_min = int(base_min + time_penalty)
     time_str = f"{total_min // 60} ч {total_min % 60} мин"
     await wait_msg.edit_text(f"🗺 <b>Маршрут:</b>\n{start_point.capitalize()} ➡️ {end_point.capitalize()}\n📏 {dist_km:.1f} км\n⏱ {time_str}", parse_mode="HTML")
 
 # --- Обработчики инлайн-клавиатуры ---
+@dp.callback_query(F.data == "select_all")
+async def process_select_all(callback: CallbackQuery):
+    all_cities = list(REGION_CITIES.keys())
+    save_user_cities(callback.from_user.id, all_cities)
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(all_cities))
+    await callback.answer("Выбраны все города")
+
+@dp.callback_query(F.data == "clear_all")
+async def process_clear_all(callback: CallbackQuery):
+    save_user_cities(callback.from_user.id, [])
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard([]))
+    await callback.answer("Список городов очищен")
+
 @dp.callback_query(F.data.startswith("toggle_"))
 async def process_toggle_city(callback: CallbackQuery):
     city = callback.data.split("_")[1]
-    settings = get_user_settings(callback.from_user.id)
-    user_cities = settings["cities"]
+    user_cities = get_user_cities(callback.from_user.id)
     if city in user_cities: user_cities.remove(city)
     else: user_cities.append(city)
     save_user_cities(callback.from_user.id, user_cities)
@@ -635,7 +686,6 @@ async def process_save_settings(callback: CallbackQuery):
 # --- Запуск ---
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
-    # Запускаем проверку каждую минуту
     scheduler.add_job(broadcast_job, trigger='cron', minute='*')
     scheduler.start()
     print("Бот запущен. Планировщик активен (проверка каждую минуту).")

@@ -29,7 +29,7 @@ MSK_TZ = pytz.timezone("Europe/Moscow")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- База данных для настроек ---
+# --- База данных ---
 def init_db():
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
@@ -50,7 +50,7 @@ def get_user_cities(user_id: int) -> list:
     conn.close()
     if row and row[0]:
         return json.loads(row[0])
-    return ["Иваново"] # По умолчанию только Иваново
+    return ["Иваново"]
 
 def save_user_cities(user_id: int, cities: list):
     conn = sqlite3.connect("users.db")
@@ -70,7 +70,7 @@ def get_subscribers() -> list:
     conn.close()
     return [row[0] for row in rows]
 
-init_db() # Инициализация БД при запуске
+init_db()
 
 # --- Список городов Ивановской области ---
 REGION_CITIES = {
@@ -93,11 +93,14 @@ REGION_CITIES = {
     "Пучеж": (56.9833, 43.1667),
 }
 
+# Ближайшие спутники Иваново
+IVANOVO_AGGLOMERATION = ["Иваново", "Кохма", "Тейково", "Фурманов", "Шуя", "Приволжск"]
+
 class RouteState(StatesGroup):
     waiting_for_start = State()
     waiting_for_end = State()
 
-# --- Погода и утилиты ---
+# --- Погода ---
 def get_weather_emoji(code):
     if code in [0, 1]: return "☀️"
     if code in [2, 3]: return "☁️"
@@ -111,15 +114,12 @@ def get_weather_emoji(code):
     return "🌡"
 
 async def get_region_weather(user_cities: list):
-    # Фильтруем только те города, которые выбрал пользователь
     selected_cities = {city: REGION_CITIES[city] for city in user_cities if city in REGION_CITIES}
-    
     if not selected_cities:
         return "⚠️ Вы не выбрали ни одного города. Зайдите в /settings."
 
     lats = ",".join(str(lat) for lat, lon in selected_cities.values())
     lons = ",".join(str(lon) for lat, lon in selected_cities.values())
-    
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&current=temperature_2m,precipitation_probability,weather_code&timezone=Europe/Moscow"
     
     async with aiohttp.ClientSession() as session:
@@ -127,7 +127,6 @@ async def get_region_weather(user_cities: list):
             async with session.get(url, timeout=10) as resp:
                 if resp.status != 200: return "⚠️ Ошибка получения погоды."
                 data = await resp.json()
-                
                 lines = []
                 for i, city in enumerate(selected_cities.keys()):
                     if i < len(data):
@@ -135,9 +134,7 @@ async def get_region_weather(user_cities: list):
                         temp = current.get("temperature_2m", 0)
                         prob = current.get("precipitation_probability", 0)
                         code = current.get("weather_code", 0)
-                        emoji = get_weather_emoji(code)
-                        lines.append(f"{emoji} <b>{city}</b>: {temp:+.0f}°C, 💧{prob}%")
-                
+                        lines.append(f"{get_weather_emoji(code)} <b>{city}</b>: {temp:+.0f}°C, 💧{prob}%")
                 return "🌍 <b>Погода в выбранных городах:</b>\n" + "\n".join(lines)
         except Exception:
             return "⚠️ Ошибка при запросе к сервису."
@@ -164,38 +161,33 @@ async def get_weather_ivanovo():
             feels = data["main"]["feels_like"]
             desc = data["weather"][0]["description"].capitalize()
             wind = data["wind"]["speed"]
-            
             emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
             road, is_bad = get_road_condition(temp, desc, wind)
-            
             text = (f"{emoji} <b>Погода в {CITY_NAME}:</b>\n"
                     f"🌡 Температура: <b>{temp:+.0f}°C</b> (ощущается {feels:+.0f}°C)\n"
-                    f"☁️ {desc}\n"
-                    f"💨 Ветер: {wind} м/с\n"
-                    f"🛣 <b>Дорога:</b> {road}")
+                    f"☁️ {desc}\n💨 Ветер: {wind} м/с\n🛣 <b>Дорога:</b> {road}")
             return text, is_bad
 
-# --- Инлайн-клавиатура для выбора городов ---
 def get_cities_keyboard(user_cities: list):
     keyboard = []
     row = []
     for city in REGION_CITIES.keys():
-        # Добавляем галочку, если город выбран
         btn_text = f"✅ {city}" if city in user_cities else city
         row.append(InlineKeyboardButton(text=btn_text, callback_data=f"toggle_{city}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
-    if row:
-        keyboard.append(row)
-    
+    if row: keyboard.append(row)
     keyboard.append([InlineKeyboardButton(text="💾 Сохранить и выйти", callback_data="save_settings")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 # --- Маршруты (Карты) ---
 async def get_coords(session, address):
+    query = address
+    if not any(city.lower() in address.lower() for city in REGION_CITIES.keys()):
+        query = f"Иваново, {address}"
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": f"Иваново, {address}", "format": "json", "limit": 1}
+    params = {"q": query, "format": "json", "limit": 1}
     headers = {"User-Agent": "MalinkiBot/1.0"}
     try:
         async with session.get(url, params=params, headers=headers, timeout=10) as resp:
@@ -229,17 +221,17 @@ def extract_street(text):
         match = re.search(pattern, text)
         if match:
             street = match.group(1)
-            if street.lower() not in ["ивановская", "областная"]: return street
+            if street.lower() not in ["ивановская", "областная", "кинешемская"]: return street
     return None
 
 def infer_traffic_impact(text):
     lower = text.lower()
     if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет"]):
-        return "🔴 <b>Высокое</b>. Возможна серьезная пробка."
+        return "🔴 <b>Высокое</b>. Возможна серьезная пробка.", True # is_high
     elif any(w in lower for w in ["дтп", "авария", "столкновение", "пострадал", "скорая", "затор"]):
-        return "🟠 <b>Среднее</b>. Движение замедлено."
+        return "🟠 <b>Среднее</b>. Движение замедлено.", False
     else:
-        return "🟢 <b>Низкое</b>. Затруднений нет."
+        return "🟢 <b>Низкое</b>. Затруднений нет.", False
 
 def format_time(pub_date_str=None, text=""):
     if pub_date_str:
@@ -260,6 +252,13 @@ def clean_html(raw_html):
     text = soup.get_text(separator=' ')
     return re.sub(r'\s+', ' ', text).strip()
 
+def find_city(text):
+    lower_text = text.lower()
+    for city in REGION_CITIES.keys():
+        if city.lower() in lower_text:
+            return city
+    return "Ивановская область"
+
 async def fetch_news(session, url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -278,29 +277,36 @@ async def fetch_news(session, url):
                     title_tag = item.find('title')
                     if not title_tag: continue
                     text = title_tag.get_text(strip=True)
-                    lower_text = text.lower()
+                    desc_tag = item.find('description') or item.find('summary')
+                    raw_desc = desc_tag.get_text(strip=True) if desc_tag else ""
+                    clean_desc = clean_html(raw_desc)
+                    
+                    full_text = text + " " + clean_desc
+                    lower_text = full_text.lower()
                     
                     if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
-                        if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
+                        if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
                             if not any(sw in lower_text for sw in stop_words):
                                 pub_date = item.find('pubDate')
-                                desc_tag = item.find('description') or item.find('summary')
-                                raw_desc = desc_tag.get_text(strip=True) if desc_tag else ""
-                                clean_desc = clean_html(raw_desc)
-                                found.append({"title": text, "time": format_time(pub_date.text if pub_date else None, text), "desc": clean_desc})
+                                found.append({
+                                    "title": text, 
+                                    "time": format_time(pub_date.text if pub_date else None, text),
+                                    "desc": clean_desc,
+                                    "city": find_city(full_text)
+                                })
             else:
                 for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
                     text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
                     lower_text = text.lower()
                     if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
-                        if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
+                        if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
                             if not any(sw in lower_text for sw in stop_words):
-                                found.append({"title": text, "time": format_time(None, text), "desc": ""})
+                                found.append({"title": text, "time": format_time(None, text), "desc": "", "city": find_city(text)})
             return found
     except Exception:
         return []
 
-async def get_traffic_summary(is_bad_weather=False):
+async def get_traffic_summary(is_bad_weather, user_cities):
     sources = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
     all_news = []
     async with aiohttp.ClientSession() as session:
@@ -315,17 +321,46 @@ async def get_traffic_summary(is_bad_weather=False):
         words_new = set(w.strip(".,!?\"'()-") for w in news["title"].lower().split() if len(w) > 3)
         if not any(len(words_new.intersection(set(w.strip(".,!?\"'()-") for w in ex["title"].lower().split() if len(w) > 3))) >= 2 for ex in unique_news):
             unique_news.append(news)
+            
+    # Логика фильтрации по географии и важности
+    filtered_news = []
+    for news in unique_news:
+        impact_text, is_high = infer_traffic_impact(news["title"] + " " + news["desc"])
+        news["impact_text"] = impact_text
+        news["is_high"] = is_high
+        
+        # 1. Громкие события и трассы области — показываем ВСЕМ
+        if is_high or news["city"] == "Ивановская область":
+            filtered_news.append(news)
+            continue
+            
+        # 2. Если новость в выбранном городе — показываем
+        if news["city"] in user_cities:
+            filtered_news.append(news)
+            continue
+
+        # 3. Ивановская агломерация (если выбран Иваново)
+        if "Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION:
+            filtered_news.append(news)
+            continue
+
+        # 4. Новости Иваново для жителей других городов (как обл. центр)
+        if "Иваново" not in user_cities and news["city"] == "Иваново":
+            filtered_news.append(news)
+            continue
+            
+    if not filtered_news:
+        return "✅ <b>Свежих сообщений о ДТП в выбранных городах нет.</b>"
     
-    text = "🚨 <b>Дорожная обстановка (Иваново):</b>\n"
-    if is_bad_weather and unique_news: text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
+    text = "🚨 <b>Дорожная обстановка:</b>\n"
+    if is_bad_weather: text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
     text += "\n"
     
-    for news in unique_news[:4]:
+    for news in filtered_news[:5]:
         news_text = news["title"][0].upper() + news["title"][1:]
         if news_text.endswith('.'): news_text = news_text[:-1]
         
         street = extract_street(news_text + " " + news["desc"])
-        impact = infer_traffic_impact(news_text + " " + news["desc"])
         time_str = news["time"]
 
         text += f"📝 <b>Событие:</b> {news_text}.\n"
@@ -333,8 +368,9 @@ async def get_traffic_summary(is_bad_weather=False):
             short_desc = news["desc"][:200] + "..." if len(news["desc"]) > 200 else news["desc"]
             text += f"📄 <b>Детали:</b> <i>{short_desc}</i>\n"
         text += f"🕒 <b>Время:</b> {time_str}.\n"
+        text += f"🏙 <b>Город:</b> {news['city']}.\n"
         if street: text += f"📍 <b>Локация:</b> {street}.\n"
-        text += f"🚦 <b>Влияние:</b> {impact}\n"
+        text += f"🚦 <b>Влияние:</b> {news['impact_text']}\n"
         text += "➖➖➖➖➖➖➖➖\n"
 
     return text
@@ -345,72 +381,53 @@ async def morning_broadcast():
     if not subscribers: return
     
     weather_text, is_bad = await get_weather_ivanovo()
-    traffic_text = await get_traffic_summary(is_bad_weather=is_bad)
     
     for user_id in subscribers:
         user_cities = get_user_cities(user_id)
         region_text = await get_region_weather(user_cities)
+        traffic_text = await get_traffic_summary(is_bad, user_cities)
         
         full_text = f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather_text}\n\n{region_text}\n\n{traffic_text}"
-        try: 
-            await bot.send_message(user_id, full_text, parse_mode="HTML")
-        except Exception: 
-            pass # Если пользователь заблокировал бота
+        try: await bot.send_message(user_id, full_text, parse_mode="HTML")
+        except Exception: pass
 
 # --- Хэндлеры ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        f"👋 Привет! Я слежу за погодой и дорожной обстановкой в {CITY_NAME}.\n\n"
+        f"👋 Привет! Я слежу за погодой и дорожной обстановкой.\n\n"
         "📋 <b>Команды:</b>\n"
         "/weather — погода в Иваново 🌤\n"
         "/region — погода в выбранных городах 🌍\n"
-        "/settings — выбрать города для сводки ⚙️\n"
-        "/traffic — пробки и ДТП 🚦\n"
+        "/settings — выбрать города ⚙️\n"
+        "/traffic — ДТП и пробки 🚦\n"
         "/all — всё сразу 🗂\n"
-        "/route — построить маршрут 🗺\n"
-        "/subscribe — включить утреннюю сводку (05:00) ⏰\n"
-        "/unsubscribe — выключить рассылку 🔕",
+        "/route — маршрут 🗺\n"
+        "/subscribe — рассылка в 05:00 ⏰\n"
+        "/unsubscribe — отписаться 🔕",
         parse_mode="HTML"
     )
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
     user_cities = get_user_cities(message.from_user.id)
-    await message.answer(
-        "⚙️ <b>Настройка городов</b>\n"
-        "Нажимайте на города, чтобы добавить или убрать их из сводки. "
-        "Затем нажмите «Сохранить».",
-        reply_markup=get_cities_keyboard(user_cities),
-        parse_mode="HTML"
-    )
+    await message.answer("⚙️ <b>Настройка городов</b>\nВыберите города для отслеживания:", reply_markup=get_cities_keyboard(user_cities), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("toggle_"))
 async def process_toggle_city(callback: CallbackQuery):
     city = callback.data.split("_")[1]
     user_cities = get_user_cities(callback.from_user.id)
-    
-    if city in user_cities:
-        user_cities.remove(city)
-    else:
-        user_cities.append(city)
-        
-    # Обновляем клавиатуру
+    if city in user_cities: user_cities.remove(city)
+    else: user_cities.append(city)
     await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(user_cities))
     await callback.answer(f"{city} {'добавлен' if city in user_cities else 'убран'}")
 
 @dp.callback_query(F.data == "save_settings")
 async def process_save_settings(callback: CallbackQuery):
-    # Сохраняем то, что сейчас на клавиатуре (парсим кнопки)
     keyboard = callback.message.reply_markup.inline_keyboard
-    selected_cities = []
-    for row in keyboard:
-        for btn in row:
-            if btn.text.startswith("✅"):
-                selected_cities.append(btn.text.replace("✅ ", ""))
-                
+    selected_cities = [btn.text.replace("✅ ", "") for row in keyboard for btn in row if btn.text.startswith("✅")]
     save_user_cities(callback.from_user.id, selected_cities)
-    await callback.message.edit_text("✅ Настройки сохранены! Теперь сводка будет формироваться по выбранным городам.")
+    await callback.message.edit_text("✅ Настройки сохранены! Теперь бот учтет ваши предпочтения.")
     await callback.answer()
 
 @dp.message(Command("region"))
@@ -421,13 +438,13 @@ async def cmd_region(message: types.Message):
 @dp.message(Command("route"))
 async def cmd_route(message: types.Message, state: FSMContext):
     await state.set_state(RouteState.waiting_for_start)
-    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или улицу.", parse_mode="HTML")
+    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или город.", parse_mode="HTML")
 
 @dp.message(RouteState.waiting_for_start)
 async def process_route_start(message: types.Message, state: FSMContext):
     await state.update_data(start_point=message.text)
     await state.set_state(RouteState.waiting_for_end)
-    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес.")
+    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес или город.")
 
 @dp.message(RouteState.waiting_for_end)
 async def process_route_end(message: types.Message, state: FSMContext):
@@ -450,9 +467,10 @@ async def process_route_end(message: types.Message, state: FSMContext):
         dist_km, base_min = route_data
 
     _, is_bad_weather = await get_weather_ivanovo()
-    traffic_text = await get_traffic_summary(is_bad_weather=is_bad_weather)
+    user_cities = get_user_cities(message.from_user.id)
+    traffic_text = await get_traffic_summary(is_bad_weather, user_cities)
     time_penalty = 10 if "🚨" in traffic_text else 0
-    warning = "\n⚠️ <i>В городе есть ДТП (см. /traffic). Возможны задержки.</i>" if time_penalty else ""
+    warning = "\n⚠️ <i>На дорогах есть ДТП. Возможны задержки.</i>" if time_penalty else ""
 
     total_min = int(base_min + time_penalty)
     hours, mins = total_min // 60, total_min % 60
@@ -466,8 +484,8 @@ async def process_route_end(message: types.Message, state: FSMContext):
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: types.Message):
     user_cities = get_user_cities(message.from_user.id)
-    save_user_cities(message.from_user.id, user_cities) # Гарантируем наличие в БД
-    await message.answer("✅ Вы подписаны на утреннюю сводку! Бот пришлет её завтра в 05:00 по Москве.")
+    save_user_cities(message.from_user.id, user_cities)
+    await message.answer("✅ Вы подписаны на утреннюю сводку в 05:00!")
 
 @dp.message(Command("unsubscribe"))
 async def cmd_unsubscribe(message: types.Message):
@@ -476,7 +494,7 @@ async def cmd_unsubscribe(message: types.Message):
     cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (message.from_user.id,))
     conn.commit()
     conn.close()
-    await message.answer("❌ Вы отписаны от утренней сводки.")
+    await message.answer("❌ Вы отписаны от рассылки.")
 
 @dp.message(Command("weather"))
 async def cmd_weather(message: types.Message):
@@ -486,14 +504,15 @@ async def cmd_weather(message: types.Message):
 @dp.message(Command("traffic"))
 async def cmd_traffic(message: types.Message):
     _, is_bad = await get_weather_ivanovo()
-    await message.answer(await get_traffic_summary(is_bad_weather=is_bad), parse_mode="HTML")
+    user_cities = get_user_cities(message.from_user.id)
+    await message.answer(await get_traffic_summary(is_bad, user_cities), parse_mode="HTML")
 
 @dp.message(Command("all"))
 async def cmd_all(message: types.Message):
     weather_text, is_bad = await get_weather_ivanovo()
     user_cities = get_user_cities(message.from_user.id)
     region_text = await get_region_weather(user_cities)
-    traffic_text = await get_traffic_summary(is_bad_weather=is_bad)
+    traffic_text = await get_traffic_summary(is_bad, user_cities)
     await message.answer(f"{weather_text}\n\n{region_text}\n\n{traffic_text}", parse_mode="HTML")
 
 async def main():

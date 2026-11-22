@@ -1,6 +1,7 @@
 import os
 import asyncio
 import aiohttp
+import re
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -37,22 +38,35 @@ async def get_weather():
             
             emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
             
-            return (f"{emoji} Погода в {CITY_NAME}:\n"
-                    f"🌡 Температура: {temp:+.0f}°C (ощущается {feels:+.0f}°C)\n"
+            return (f"{emoji} <b>Погода в {CITY_NAME}:</b>\n"
+                    f"🌡 Температура: <b>{temp:+.0f}°C</b> (ощущается {feels:+.0f}°C)\n"
                     f"☁️ {desc}\n"
                     f"💨 Ветер: {wind} м/с")
 
 # --- ДТП и заторы ---
-def is_duplicate(new_text, existing_texts):
-    """Умная проверка на дубли по пересечению важных слов"""
-    # Очищаем от знаков препинания и разбиваем на слова
-    words_new = set(w.strip(".,!?\"'()-") for w in new_text.lower().split() if len(w) > 3)
-    for existing in existing_texts:
-        words_ex = set(w.strip(".,!?\"'()-") for w in existing.lower().split() if len(w) > 3)
-        # Если совпадает 2 и более значимых слов (например, "дтп" и "погибшими"), это дубль
-        if len(words_new.intersection(words_ex)) >= 2:
-            return True
-    return False
+def extract_street(text):
+    """Пытается вытащить улицу из текста"""
+    # Ищем паттерны: "ул. Название", "улица Название", "на Название"
+    patterns = [
+        r'ул(?:ица|\.)?\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
+        r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+def get_status(text):
+    """Определяет статус по ключевым словам"""
+    lower = text.lower()
+    if "перекрыт" in lower or "закрыт" in lower:
+        return "🔴 Перекрыто"
+    if "пробка" in lower or "затор" in lower or "стоит" in lower:
+        return "🟠 Затруднено"
+    if "дтп" in lower or "авари" in lower:
+        return "🟡 ДТП"
+    return "⚪ Инфо"
 
 async def fetch_news(session, url):
     try:
@@ -64,7 +78,6 @@ async def fetch_news(session, url):
             soup = BeautifulSoup(html, "html.parser")
             
             keywords = ["дтп", "авария", "аварии", "пробка", "пробки", "затор", "столкновение", "перекрыт"]
-            # Стоп-слова, чтобы не тащить новости других регионов
             stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
             
             found = []
@@ -72,15 +85,10 @@ async def fetch_news(session, url):
                 text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
                 lower_text = text.lower()
                 
-                # 1. Фильтр длины (20-90 символов)
-                if not (20 <= len(text) <= 90):
+                if not (20 <= len(text) <= 100):
                     continue
-                    
-                # 2. Есть ключевое слово?
                 if not any(kw in lower_text for kw in keywords):
                     continue
-                    
-                # 3. Есть локальный контекст и нет стоп-слов?
                 if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
                     if not any(sw in lower_text for sw in stop_words):
                         found.append(text)
@@ -88,7 +96,7 @@ async def fetch_news(session, url):
     except Exception:
         return []
 
-async def get_accidents():
+async def get_traffic_summary():
     sources = [
         "https://newsivanovo.ru/rss",
         "https://ivanovonews.ru/rss/",
@@ -104,18 +112,53 @@ async def get_accidents():
             all_news.extend(res)
             
     if not all_news:
-        return "✅ Свежих сообщений о ДТП и заторах в Иваново не найдено."
-        
+        return "✅ <b>Свежих сообщений о ДТП и заторах в Иваново не найдено.</b>"
+    
+    # Дедупликация по пересечению слов
     unique_news = []
     for news in all_news:
-        if not is_duplicate(news, unique_news):
+        words_new = set(w.strip(".,!?\"'()-") for w in news.lower().split() if len(w) > 3)
+        is_dup = False
+        for existing in unique_news:
+            words_ex = set(w.strip(".,!?\"'()-") for w in existing.lower().split() if len(w) > 3)
+            if len(words_new.intersection(words_ex)) >= 2:
+                is_dup = True
+                break
+        if not is_dup:
             unique_news.append(news)
-            
-    final_news = unique_news[:5]
+    
+    # Формируем структурированный список
+    incidents = []
+    has_major_jam = False
+    
+    for news in unique_news[:6]:
+        street = extract_street(news)
+        status = get_status(news)
+        if status == "🔴 Перекрыто" or status == "🟠 Затруднено":
+            has_major_jam = True
+        
+        # Очищаем текст от лишнего, оставляем суть
+        summary = news
+        if len(summary) > 80:
+            summary = summary[:77] + "..."
+        
+        if street:
+            incidents.append(f"{status} <b>ул. {street}</b>\n   <i>{summary}</i>")
+        else:
+            incidents.append(f"{status} <i>{summary}</i>")
+    
+    # Определяем общий уровень (эвристика)
+    if has_major_jam:
+        level = "🟠 <b>Затруднено</b> (есть перекрытия/заторы)"
+    elif incidents:
+        level = "🟡 <b>Небольшие осложнения</b>"
+    else:
+        level = "🟢 <b>Свободно</b>"
     
     text = "🚦 <b>Дорожная обстановка (Иваново):</b>\n\n"
-    for item in final_news:
-        text += f"🔴 {item}\n\n"
+    text += f"📊 Уровень: {level}\n\n"
+    text += "\n\n".join(incidents)
+    
     return text
 
 # --- Утренняя рассылка ---
@@ -124,7 +167,7 @@ async def morning_broadcast():
         return
     
     weather = await get_weather()
-    traffic = await get_accidents()
+    traffic = await get_traffic_summary()
     text = f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather}\n\n{traffic}"
     
     for chat_id in list(SUBSCRIBERS):
@@ -159,16 +202,16 @@ async def cmd_unsubscribe(message: types.Message):
 
 @dp.message(Command("weather"))
 async def cmd_weather(message: types.Message):
-    await message.answer(await get_weather())
+    await message.answer(await get_weather(), parse_mode="HTML")
 
 @dp.message(Command("traffic"))
 async def cmd_traffic(message: types.Message):
-    await message.answer(await get_accidents(), parse_mode="HTML")
+    await message.answer(await get_traffic_summary(), parse_mode="HTML")
 
 @dp.message(Command("all"))
 async def cmd_all(message: types.Message):
     weather = await get_weather()
-    traffic = await get_accidents()
+    traffic = await get_traffic_summary()
     await message.answer(f"{weather}\n\n{traffic}", parse_mode="HTML")
 
 

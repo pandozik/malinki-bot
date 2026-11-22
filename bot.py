@@ -21,7 +21,7 @@ from email.utils import parsedate_to_datetime
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY") # Оставил, если захочешь вернуть OWM, но сейчас не используется
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY") 
 
 CITY_NAME = "Иваново"
 MSK_TZ = pytz.timezone("Europe/Moscow")
@@ -245,7 +245,7 @@ async def get_fuel_prices(show_delta=False):
 async def get_fuel_situation_news():
     sources = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
     keywords = ["дефицит", "бензин", "топливо", "азс", "заправк", "очеред", "лимит", "ограничен"]
-    stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
+    stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ", "пробаци", "проблем"]
     found_news = []
     
     async with aiohttp.ClientSession() as session:
@@ -259,8 +259,10 @@ async def get_fuel_situation_news():
                         if not title_tag: continue
                         text = title_tag.get_text(strip=True)
                         lower_text = text.lower()
-                        if any(kw in lower_text for kw in keywords) and ("иванов" in lower_text or "област" in lower_text):
-                            if not any(sw in lower_text for sw in stop_words):
+                        
+                        # Строгая проверка на целые слова
+                        if any(re.search(rf'\b{kw}\b', lower_text) for kw in keywords) and ("иванов" in lower_text or "област" in lower_text):
+                            if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
                                 if not any(text.lower() in ex.lower() or ex.lower() in text.lower() for ex in found_news):
                                     found_news.append(text)
             except Exception: continue
@@ -290,7 +292,7 @@ async def get_route_info(session, start_coords, end_coords):
     except Exception: pass
     return None
 
-# --- Анализ ДТП и Заторов ---
+# --- Анализ ДТП и Заторов (Строгий фильтр) ---
 def extract_street(text):
     patterns = [
         r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
@@ -338,8 +340,9 @@ async def fetch_news(session, url):
     try:
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8) as resp:
             soup = BeautifulSoup(await resp.text(), "html.parser")
-            keywords = ["дтп", "авария", "пробка", "затор", "столкновение", "перекрыт", "пострадал", "скопление"]
-            stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
+            # Строгий поиск по целым словам
+            pattern = r'\b(дтп|авария|аварии|пробка|пробки|затор|столкновение|перекрыт|пострадал|скопление)\b'
+            stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ", "пробаци", "проблем"]
             found = []
             for item in soup.find_all('item'):
                 title_tag = item.find('title')
@@ -347,9 +350,10 @@ async def fetch_news(session, url):
                 text = title_tag.get_text(strip=True)
                 clean_desc = clean_html(item.find('description').get_text(strip=True) if item.find('description') else "")
                 lower_text = (text + " " + clean_desc).lower()
-                if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
+                
+                if 20 <= len(text) <= 120 and re.search(pattern, lower_text):
                     if ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
-                        if not any(sw in lower_text for sw in stop_words):
+                        if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
                             found.append({"title": text, "time": format_time(item.find('pubDate').text if item.find('pubDate') else None, text), "desc": clean_desc, "city": find_city(lower_text)})
             return found
     except Exception: return []
@@ -360,12 +364,13 @@ async def fetch_telegram_channel(session, channel_name):
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10) as resp:
             if resp.status != 200: return []
             soup = BeautifulSoup(await resp.text(), "html.parser")
-            keywords = ["затор", "пробка", "скопление", "затруднено", "перекрыт", "стоит"]
+            # Строгий поиск по целым словам
+            pattern = r'\b(затор|пробка|пробки|скопление|затруднено|перекрыт|стоит)\b'
             found = []
             for msg in soup.find_all("div", class_="tgme_widget_message_text"):
                 text = msg.get_text(separator=' ', strip=True)
                 lower_text = text.lower()
-                if any(kw in lower_text for kw in keywords) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
+                if re.search(pattern, lower_text) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
                     found.append({"title": text[:100] + "...", "desc": text, "city": find_city(text), "time": "Недавно"})
             return found
     except Exception: return []
@@ -375,12 +380,12 @@ async def fetch_vk_group(session, group_url):
         async with session.get(group_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10) as resp:
             if resp.status != 200: return []
             soup = BeautifulSoup(await resp.text(), "html.parser")
-            keywords = ["затор", "пробка", "скопление", "затруднено", "перекрыт"]
+            pattern = r'\b(затор|пробка|пробки|скопление|затруднено|перекрыт)\b'
             found = []
             for post in soup.find_all("div", class_="wall_post_text"):
                 text = post.get_text(separator=' ', strip=True)
                 lower_text = text.lower()
-                if any(kw in lower_text for kw in keywords):
+                if re.search(pattern, lower_text):
                     found.append({"title": text[:100] + "...", "desc": text, "city": find_city(text), "time": "Недавно"})
             return found
     except Exception: return []

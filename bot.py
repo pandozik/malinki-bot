@@ -67,18 +67,32 @@ async def get_weather():
                     f"🛣 <b>Дорога:</b> {road_condition}")
             return text, is_bad_weather
 
-# --- Логика анализа новостей ---
+# --- Улучшенный анализ локации ---
 def extract_street(text):
+    """Ищет улицы, проспекты, шоссе и переулки в тексте новости"""
+    # Паттерны для разных типов адресов
     patterns = [
-        r'ул(?:ица|\.)?\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
-        r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
+        # Улица, проспект, переулок, шоссе, площадь, микрорайон (сокращения и полные)
+        r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
+        
+        # "на Лежневской", "на Строителей"
+        r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:ой|ий|ая|ое|ые))',
+        
+        # "в Ивановском районе", "в Ленинском"
         r'в\s+([А-ЯЁ][а-яё]+ском)\s+районе',
+        
+        # Просто названия, оканчивающиеся на "ская" (часто улицы в Иваново)
+        r'\b([А-ЯЁ][а-яё]+ская)\b'
     ]
+    
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return match.group(1)
-    return "Иваново / Область"
+            street = match.group(1)
+            # Исключаем ложные срабатывания (если вдруг поймали не то)
+            if street.lower() not in ["ивановская", "областная"]: 
+                return street
+    return None
 
 def infer_traffic_impact(text):
     lower = text.lower()
@@ -90,7 +104,6 @@ def infer_traffic_impact(text):
         return "🟢 <b>Низкое</b>. Существенных затруднений не ожидается."
 
 def format_time(pub_date_str=None, text=""):
-    """Извлекает время из RSS или из текста"""
     if pub_date_str:
         try:
             dt = parsedate_to_datetime(pub_date_str)
@@ -105,7 +118,6 @@ def format_time(pub_date_str=None, text=""):
         except Exception:
             pass
             
-    # Если RSS не дал время, ищем в тексте (например, "в 14:30")
     match = re.search(r'\b([01]?[0-9]|2[0-3]):[0-5][0-9]\b', text)
     if match:
         return match.group(0)
@@ -124,7 +136,6 @@ async def fetch_news(session, url):
             stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
             found = []
 
-            # 1. Пытаемся парсить как RSS (там есть время)
             items = soup.find_all('item')
             if items:
                 for item in items:
@@ -140,7 +151,6 @@ async def fetch_news(session, url):
                                 pub_date_str = pub_date.text if pub_date else None
                                 found.append({"title": text, "time": format_time(pub_date_str, text)})
             else:
-                # 2. Если это HTML-страница, время ищем только в тексте
                 for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
                     text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
                     lower_text = text.lower()
@@ -197,7 +207,11 @@ async def get_traffic_summary(is_bad_weather=False):
 
         text += f"📝 <b>Событие:</b> {news_text}.\n"
         text += f"🕒 <b>Время:</b> {time_str}.\n"
-        text += f"📍 <b>Локация:</b> {street}.\n"
+        
+        # Если улица найдена — выводим. Если нет — пропускаем строку.
+        if street:
+            text += f"📍 <b>Локация:</b> {street}.\n"
+            
         text += f"🚦 <b>Влияние:</b> {impact}\n"
         text += "➖➖➖➖➖➖➖➖\n"
 

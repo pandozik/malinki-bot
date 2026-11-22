@@ -27,7 +27,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 SUBSCRIBERS = set()
 
-# --- Состояния для маршрута ---
 class RouteState(StatesGroup):
     waiting_for_start = State()
     waiting_for_end = State()
@@ -35,15 +34,15 @@ class RouteState(StatesGroup):
 # --- Погода ---
 def get_road_condition(temp, desc, wind):
     desc = desc.lower()
-    if "снег" in desc: return "❄️ Снегопад. Дороги скользкие."
+    if "снег" in desc: return "❄️ Снегопад. Дороги скользкие.", True
     elif "дождь" in desc:
-        if temp < 2: return "🌧 Гололедица. Высокий риск ДТП!"
-        return "🌧 Мокрый асфальт. Тормозной путь увеличен."
-    elif "туман" in desc: return "🌫 Плохая видимость."
-    elif temp < -5: return "🧊 Наледь на дорогах."
-    elif temp > 25: return "☀️ Жарко. Дороги сухие."
-    elif "ясно" in desc or "облачно" in desc: return "✅ Дороги сухие."
-    return "⚪ Стандартные условия."
+        if temp < 2: return "🌧 Гололедица. Высокий риск ДТП!", True
+        return "🌧 Мокрый асфальт. Тормозной путь увеличен.", True
+    elif "туман" in desc: return "🌫 Плохая видимость.", True
+    elif temp < -5: return "🧊 Наледь на дорогах.", True
+    elif temp > 25: return "☀️ Жарко. Дороги сухие.", False
+    elif "ясно" in desc or "облачно" in desc: return "✅ Дороги сухие.", False
+    return "⚪ Стандартные условия.", False
 
 async def get_weather():
     url = f"https://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
@@ -57,8 +56,7 @@ async def get_weather():
             wind = data["wind"]["speed"]
             
             emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
-            road = get_road_condition(temp, desc, wind)
-            is_bad = any(w in desc.lower() for w in ["снег", "дождь", "туман"]) or temp < 2
+            road, is_bad = get_road_condition(temp, desc, wind)
             
             text = (f"{emoji} <b>Погода в {CITY_NAME}:</b>\n"
                     f"🌡 Температура: <b>{temp:+.0f}°C</b> (ощущается {feels:+.0f}°C)\n"
@@ -69,40 +67,27 @@ async def get_weather():
 
 # --- Маршруты (Карты) ---
 async def get_coords(session, address):
-    """Получает координаты по адресу (привязка к Иваново)"""
     url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": f"Иваново, {address}",
-        "format": "json",
-        "limit": 1
-    }
-    headers = {"User-Agent": "MalinkiBot/1.0 (Telegram Bot)"}
+    params = {"q": f"Иваново, {address}", "format": "json", "limit": 1}
+    headers = {"User-Agent": "MalinkiBot/1.0"}
     try:
         async with session.get(url, params=params, headers=headers, timeout=10) as resp:
             data = await resp.json()
-            if data:
-                return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception:
-        pass
+            if data: return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception: pass
     return None
 
 async def get_route_info(session, start_coords, end_coords):
-    """Строит маршрут и считает время через OSRM"""
     start_lon, start_lat = start_coords[1], start_coords[0]
     end_lon, end_lat = end_coords[1], end_coords[0]
-    
     url = f"http://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}?overview=false"
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status != 200: return None
             data = await resp.json()
             if data.get("routes"):
-                route = data["routes"][0]
-                distance_km = route["distance"] / 1000
-                duration_min = route["duration"] / 60
-                return distance_km, duration_min
-    except Exception:
-        pass
+                return data["routes"][0]["distance"] / 1000, data["routes"][0]["duration"] / 60
+    except Exception: pass
     return None
 
 # --- Логика анализа новостей ---
@@ -123,9 +108,9 @@ def extract_street(text):
 def infer_traffic_impact(text):
     lower = text.lower()
     if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет"]):
-        return "🔴 <b>Высокое</b>. Возможна пробка."
+        return "🔴 <b>Высокое</b>. Возможна серьезная пробка."
     elif any(w in lower for w in ["дтп", "авария", "столкновение", "пострадал", "скорая", "затор"]):
-        return "🟠 <b>Среднее</b>. Замедление движения."
+        return "🟠 <b>Среднее</b>. Движение замедлено."
     else:
         return "🟢 <b>Низкое</b>. Затруднений нет."
 
@@ -141,6 +126,13 @@ def format_time(pub_date_str=None, text=""):
     match = re.search(r'\b([01]?[0-9]|2[0-3]):[0-5][0-9]\b', text)
     if match: return match.group(0)
     return "Недавно"
+
+def clean_html(raw_html):
+    """Убирает HTML-теги из описания новости и лишние пробелы"""
+    if not raw_html: return ""
+    soup = BeautifulSoup(raw_html, "html.parser")
+    text = soup.get_text(separator=' ')
+    return re.sub(r'\s+', ' ', text).strip()
 
 async def fetch_news(session, url):
     try:
@@ -161,19 +153,30 @@ async def fetch_news(session, url):
                     if not title_tag: continue
                     text = title_tag.get_text(strip=True)
                     lower_text = text.lower()
+                    
                     if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
                         if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
                             if not any(sw in lower_text for sw in stop_words):
                                 pub_date = item.find('pubDate')
-                                found.append({"title": text, "time": format_time(pub_date.text if pub_date else None, text)})
+                                # Ищем описание
+                                desc_tag = item.find('description') or item.find('summary')
+                                raw_desc = desc_tag.get_text(strip=True) if desc_tag else ""
+                                clean_desc = clean_html(raw_desc)
+                                
+                                found.append({
+                                    "title": text, 
+                                    "time": format_time(pub_date.text if pub_date else None, text),
+                                    "desc": clean_desc
+                                })
             else:
+                # Если нет RSS, берем только заголовки (без описаний)
                 for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
                     text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
                     lower_text = text.lower()
                     if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
                         if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
                             if not any(sw in lower_text for sw in stop_words):
-                                found.append({"title": text, "time": format_time(None, text)})
+                                found.append({"title": text, "time": format_time(None, text), "desc": ""})
             return found
     except Exception:
         return []
@@ -201,11 +204,18 @@ async def get_traffic_summary(is_bad_weather=False):
     for news in unique_news[:4]:
         news_text = news["title"][0].upper() + news["title"][1:]
         if news_text.endswith('.'): news_text = news_text[:-1]
-        street = extract_street(news_text)
-        impact = infer_traffic_impact(news_text)
+        
+        street = extract_street(news_text + " " + news["desc"]) # Ищем улицу и в описании тоже
+        impact = infer_traffic_impact(news_text + " " + news["desc"])
         time_str = news["time"]
 
         text += f"📝 <b>Событие:</b> {news_text}.\n"
+        
+        # Если есть описание, выводим его подробности
+        if news["desc"] and len(news["desc"]) > 20:
+            short_desc = news["desc"][:200] + "..." if len(news["desc"]) > 200 else news["desc"]
+            text += f"📄 <b>Детали:</b> <i>{short_desc}</i>\n"
+
         text += f"🕒 <b>Время:</b> {time_str}.\n"
         if street: text += f"📍 <b>Локация:</b> {street}.\n"
         text += f"🚦 <b>Влияние:</b> {impact}\n"
@@ -241,7 +251,7 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("route"))
 async def cmd_route(message: types.Message, state: FSMContext):
     await state.set_state(RouteState.waiting_for_start)
-    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или улицу (например: <i>Площадь Ленина</i> или <i>ул. Лежневская 15</i>).", parse_mode="HTML")
+    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или улицу (например: <i>Площадь Ленина</i>).", parse_mode="HTML")
 
 @dp.message(RouteState.waiting_for_start)
 async def process_route_start(message: types.Message, state: FSMContext):
@@ -263,7 +273,7 @@ async def process_route_end(message: types.Message, state: FSMContext):
         end_coords = await get_coords(session, end_point)
         
         if not start_coords or not end_coords:
-            await wait_msg.edit_text("❌ Не удалось найти один из адресов. Попробуйте указать точнее (например, добавить 'улица').")
+            await wait_msg.edit_text("❌ Не удалось найти один из адресов. Попробуйте указать точнее.")
             return
 
         route_data = await get_route_info(session, start_coords, end_coords)
@@ -274,15 +284,12 @@ async def process_route_end(message: types.Message, state: FSMContext):
 
         dist_km, base_min = route_data
 
-    # Проверяем новости на наличие ДТП
     _, is_bad_weather = await get_weather()
     traffic_text = await get_traffic_summary(is_bad_weather=is_bad_weather)
     
-    # Эвристика: если в новостях есть ДТП, мы добавляем время к маршруту
     time_penalty = 0
     warning = ""
     if "🚨" in traffic_text:
-        # Если нашли ДТП, делаем скидку на пробки (добавляем 5-15 минут)
         time_penalty = 10
         warning = "\n⚠️ <i>В городе есть ДТП (см. /traffic). Возможны задержки в пути.</i>"
 
@@ -298,7 +305,7 @@ async def process_route_end(message: types.Message, state: FSMContext):
         f"📏 <b>Расстояние:</b> {dist_km:.1f} км\n"
         f"⏱ <b>Примерное время:</b> {time_str}\n"
         f"{warning}\n\n"
-        f"🛣 <i>Расчет по разрешенной скорости (без учета текущих баллов пробок).</i>"
+        f"🛣 <i>Расчет по разрешенной скорости.</i>"
     )
     
     await wait_msg.edit_text(result_text, parse_mode="HTML")

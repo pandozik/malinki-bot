@@ -338,67 +338,71 @@ async def get_route_info(session, start_coords, end_coords):
     except Exception: pass
     return None
 
-# --- Анализ новостей (ДТП) ---
+# --- Расширенный анализ заторов и новостей ---
+
 def extract_street(text):
-    patterns = [r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)', r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:ой|ий|ая|ое|ые))', r'\b([А-ЯЁ][а-яё]+ская)\b']
+    """Улучшенный поиск улиц, проспектов, шоссе и перекрёстков"""
+    patterns = [
+        r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
+        r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:ой|ий|ая|ое|ые))',
+        r'в\s+([А-ЯЁ][а-яё]+ском)\s+районе',
+        r'\b([А-ЯЁ][а-яё]+ская)\b',
+        r'(?:перекрёст(?:ок|ке)|развязк[ае])\s+(?:улиц\s+)?([А-ЯЁ][а-яё]+(?:\s+и\s+[А-ЯЁ][а-яё]+)?)',
+        r'(?:мост[ау]?|путепровод[ау]?)\s+(?:на\s+)?([А-ЯЁ][а-яё]+)'
+    ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
             street = match.group(1)
-            if street.lower() not in ["ивановская", "областная", "кинешемская"]: return street
+            if street.lower() not in ["ивановская", "областная", "кинешемская", "шуйская"]: 
+                return street
     return None
 
 def infer_traffic_impact(text):
     lower = text.lower()
-    if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет"]): return "🔴 <b>Высокое</b>. Возможна пробка.", True
-    elif any(w in lower for w in ["дтп", "авария", "столкновение", "пострадал", "скорая", "затор"]): return "🟠 <b>Среднее</b>. Замедление.", False
+    if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет", "коллапс"]): 
+        return "🔴 <b>Высокое</b>. Возможна серьезная пробка.", True
+    elif any(w in lower for w in ["дтп", "авария", "столкновение", "пострадал", "скорая", "затор", "пробка", "скопление"]): 
+        return "🟠 <b>Среднее</b>. Замедление.", False
     return "🟢 <b>Низкое</b>. Затруднений нет.", False
 
-def format_time(pub_date_str=None, text=""):
-    if pub_date_str:
-        try:
-            dt = parsedate_to_datetime(pub_date_str).astimezone(MSK_TZ)
-            now = datetime.now(MSK_TZ)
-            if dt.date() == now.date(): return dt.strftime("%H:%M")
-            elif (now.date() - dt.date()).days == 1: return f"Вчера в {dt.strftime('%H:%M')}"
-            else: return dt.strftime("%d.%m в %H:%M")
-        except Exception: pass
-    match = re.search(r'\b([01]?[0-9]|2[0-3]):[0-5][0-9]\b', text)
-    if match: return match.group(0)
-    return "Недавно"
-
-def clean_html(raw_html):
-    if not raw_html: return ""
-    return re.sub(r'\s+', ' ', BeautifulSoup(raw_html, "html.parser").get_text(separator=' ')).strip()
-
-def find_city(text):
-    lower_text = text.lower()
-    for city in REGION_CITIES.keys():
-        if city.lower() in lower_text: return city
-    return "Ивановская область"
-
-async def fetch_news(session, url):
+async def fetch_telegram_channel(session, channel_name):
+    """Парсит публичные Telegram-каналы через веб-версию"""
+    url = f"https://t.me/s/{channel_name}"
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with session.get(url, headers=headers, timeout=8) as resp:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status != 200: return []
             html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
-            keywords = ["дтп", "авария", "пробка", "затор", "столкновение", "перекрыт", "пострадал"]
-            stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
+            messages = soup.find_all("div", class_="tgme_widget_message_text")
             found = []
+            keywords = ["затор", "пробка", "скопление", "затруднено", "перекрыт", "стоит"]
+            for msg in messages:
+                text = msg.get_text(separator=' ', strip=True)
+                lower_text = text.lower()
+                if any(kw in lower_text for kw in keywords) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
+                    found.append({"title": text[:150] + "...", "desc": text, "city": find_city(text), "time": "Недавно"})
+            return found
+    except Exception:
+        return []
 
-            items = soup.find_all('item')
-            if items:
-                for item in items:
-                    title_tag = item.find('title')
-                    if not title_tag: continue
-                    text = title_tag.get_text(strip=True)
-                    clean_desc = clean_html(item.find('description').get_text(strip=True) if item.find('description') else "")
-                    lower_text = (text + " " + clean_desc).lower()
-                    if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
-                        if ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
-                            if not any(sw in lower_text for sw in stop_words):
-                                found.append({"title": text, "time": format_time(item.find('pubDate').text if item.find('pubDate') else None, text), "desc": clean_desc, "city": find_city(lower_text)})
+async def fetch_vk_group(session, group_url):
+    """Парсит публичные страницы ВКонтакте (m.vk.ru)"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        async with session.get(group_url, headers=headers, timeout=10) as resp:
+            if resp.status != 200: return []
+            html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
+            posts = soup.find_all("div", class_="wall_post_text")
+            found = []
+            keywords = ["затор", "пробка", "скопление", "затруднено", "перекрыт"]
+            for post in posts:
+                text = post.get_text(separator=' ', strip=True)
+                lower_text = text.lower()
+                if any(kw in lower_text for kw in keywords):
+                    found.append({"title": text[:150] + "...", "desc": text, "city": find_city(text), "time": "Недавно"})
             return found
     except Exception:
         return []
@@ -406,42 +410,61 @@ async def fetch_news(session, url):
 async def get_traffic_summary(is_bad_weather, user_cities):
     sources = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
     all_news = []
+    
     async with aiohttp.ClientSession() as session:
+        # 1. Парсим RSS новостей
         tasks = [fetch_news(session, url) for url in sources]
         for res in await asyncio.gather(*tasks): all_news.extend(res)
-            
-    if not all_news: return "✅ <b>Свежих сообщений о ДТП нет.</b>"
+        
+        # 2. Парсим Telegram-каналы
+        tg_channels = ["ivanovonewsBars", "typical_kineshma", "kineshemec_ru", "mestoskop_ivanovo"]
+        tg_tasks = [fetch_telegram_channel(session, ch) for ch in tg_channels]
+        for res in await asyncio.gather(*tg_tasks): all_news.extend(res)
+        
+        # 3. Парсим группы ВК
+        vk_urls = ["https://m.vk.ru/avtopartner_ivanovo", "https://m.vk.ru/overhear_auto_shuya"]
+        vk_tasks = [fetch_vk_group(session, url) for url in vk_urls]
+        for res in await asyncio.gather(*vk_tasks): all_news.extend(res)
+
+    if not all_news: 
+        return "✅ <b>Свежих сообщений о заторах и ДТП нет.</b>"
         
     unique_news = []
     for news in all_news:
         words_new = set(w.strip(".,!?\"'()-") for w in news["title"].lower().split() if len(w) > 3)
-        if not any(len(words_new.intersection(set(w.strip(".,!?\"'()-") for w in ex["title"].lower().split() if len(w) > 3))) >= 2 for ex in unique_news):
+        if not any(len(words_new.intersection(set(w.strip(".,!?\"'()-") for w in ex["title"].lower().split() if len(w) > 3))) >= 3 for ex in unique_news):
             unique_news.append(news)
             
     filtered_news = []
     for news in unique_news:
-        impact_text, is_high = infer_traffic_impact(news["title"] + " " + news["desc"])
+        impact_text, is_high = infer_traffic_impact(news["title"] + " " + news.get("desc", ""))
         news["impact_text"] = impact_text
         
         if is_high or news["city"] == "Ивановская область" or news["city"] in user_cities or ("Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION) or ("Иваново" not in user_cities and news["city"] == "Иваново"):
             filtered_news.append(news)
             
-    if not filtered_news: return "✅ <b>Свежих сообщений о ДТП в выбранных городах нет.</b>"
+    if not filtered_news: 
+        return "✅ <b>Свежих сообщений о заторах в выбранных городах нет.</b>"
     
     text = "🚨 <b>Дорожная обстановка:</b>\n"
-    if is_bad_weather: text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
+    if is_bad_weather: 
+        text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
     text += "\n"
     
     for news in filtered_news[:5]:
         news_text = news["title"][0].upper() + news["title"][1:]
-        if news_text.endswith('.'): news_text = news_text[:-1]
-        street = extract_street(news_text + " " + news["desc"])
+        if news_text.endswith('.'): 
+            news_text = news_text[:-1]
+            
+        street = extract_street(news_text + " " + news.get("desc", ""))
+        city = news.get("city", "Ивановская область")
 
         text += f"📝 <b>Событие:</b> {news_text}.\n"
-        if news["desc"] and len(news["desc"]) > 20: text += f"📄 <b>Детали:</b> <i>{news['desc'][:200]}...</i>\n"
-        text += f"🕒 <b>Время:</b> {news['time']}.\n🏙 <b>Город:</b> {news['city']}.\n"
-        if street: text += f"📍 <b>Локация:</b> {street}.\n"
-        text += f"🚦 <b>Влияние:</b> {news['impact_text']}\n➖➖➖➖➖➖➖➖\n"
+        if street: 
+            text += f"📍 <b>Улица:</b> {street}.\n"
+        text += f"🏙 <b>Город:</b> {city}.\n"
+        text += f"🚦 <b>Влияние:</b> {news['impact_text']}\n"
+        text += "➖➖➖➖➖➖➖➖\n"
 
     return text
 

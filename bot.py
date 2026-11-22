@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 
 load_dotenv()
 
@@ -18,16 +19,15 @@ WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 CITY = "Ivanovo,ru"
 CITY_NAME = "Иваново"
+MSK_TZ = pytz.timezone("Europe/Moscow")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 SUBSCRIBERS = set()
 
-# --- Оценка влияния погоды на дорогу ---
+# --- Погода ---
 def get_road_condition(temp, desc, wind):
-    """Анализирует погоду и выдает состояние дорог"""
     desc = desc.lower()
-    
     if "снег" in desc:
         return "❄️ Снегопад. Дороги скользкие, возможны заносы. Будьте осторожны!"
     elif "дождь" in desc:
@@ -42,10 +42,8 @@ def get_road_condition(temp, desc, wind):
         return "☀️ Жарко. Дороги сухие, но возможна усталость за рулем."
     elif "ясно" in desc or "облачно" in desc:
         return "✅ Дороги сухие, видимость хорошая."
-    
     return "⚪ Дорожные условия стандартные."
 
-# --- Погода ---
 async def get_weather():
     url = f"https://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
     async with aiohttp.ClientSession() as session:
@@ -60,8 +58,6 @@ async def get_weather():
             
             emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
             road_condition = get_road_condition(temp, desc, wind)
-            
-            # Возвращаем текст и флаг "плохая ли погода для дорог"
             is_bad_weather = any(w in desc.lower() for w in ["снег", "дождь", "туман"]) or temp < 2
             
             text = (f"{emoji} <b>Погода в {CITY_NAME}:</b>\n"
@@ -93,6 +89,29 @@ def infer_traffic_impact(text):
     else:
         return "🟢 <b>Низкое</b>. Существенных затруднений не ожидается."
 
+def format_time(pub_date_str=None, text=""):
+    """Извлекает время из RSS или из текста"""
+    if pub_date_str:
+        try:
+            dt = parsedate_to_datetime(pub_date_str)
+            dt_msk = dt.astimezone(MSK_TZ)
+            now = datetime.now(MSK_TZ)
+            if dt_msk.date() == now.date():
+                return dt_msk.strftime("%H:%M")
+            elif (now.date() - dt_msk.date()).days == 1:
+                return f"Вчера в {dt_msk.strftime('%H:%M')}"
+            else:
+                return dt_msk.strftime("%d.%m в %H:%M")
+        except Exception:
+            pass
+            
+    # Если RSS не дал время, ищем в тексте (например, "в 14:30")
+    match = re.search(r'\b([01]?[0-9]|2[0-3]):[0-5][0-9]\b', text)
+    if match:
+        return match.group(0)
+        
+    return "Недавно"
+
 async def fetch_news(session, url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -103,15 +122,32 @@ async def fetch_news(session, url):
             
             keywords = ["дтп", "авария", "аварии", "пробка", "пробки", "затор", "столкновение", "перекрыт", "вылет", "пострадал"]
             stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
-            
             found = []
-            for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
-                text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
-                lower_text = text.lower()
-                if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
-                    if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
-                        if not any(sw in lower_text for sw in stop_words):
-                            found.append(text)
+
+            # 1. Пытаемся парсить как RSS (там есть время)
+            items = soup.find_all('item')
+            if items:
+                for item in items:
+                    title_tag = item.find('title')
+                    if not title_tag: continue
+                    text = title_tag.get_text(strip=True)
+                    lower_text = text.lower()
+                    
+                    if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
+                        if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
+                            if not any(sw in lower_text for sw in stop_words):
+                                pub_date = item.find('pubDate')
+                                pub_date_str = pub_date.text if pub_date else None
+                                found.append({"title": text, "time": format_time(pub_date_str, text)})
+            else:
+                # 2. Если это HTML-страница, время ищем только в тексте
+                for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
+                    text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
+                    lower_text = text.lower()
+                    if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
+                        if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
+                            if not any(sw in lower_text for sw in stop_words):
+                                found.append({"title": text, "time": format_time(None, text)})
             return found
     except Exception:
         return []
@@ -136,10 +172,10 @@ async def get_traffic_summary(is_bad_weather=False):
         
     unique_news = []
     for news in all_news:
-        words_new = set(w.strip(".,!?\"'()-") for w in news.lower().split() if len(w) > 3)
+        words_new = set(w.strip(".,!?\"'()-") for w in news["title"].lower().split() if len(w) > 3)
         is_dup = False
         for existing in unique_news:
-            words_ex = set(w.strip(".,!?\"'()-") for w in existing.lower().split() if len(w) > 3)
+            words_ex = set(w.strip(".,!?\"'()-") for w in existing["title"].lower().split() if len(w) > 3)
             if len(words_new.intersection(words_ex)) >= 2:
                 is_dup = True
                 break
@@ -147,21 +183,20 @@ async def get_traffic_summary(is_bad_weather=False):
             unique_news.append(news)
     
     text = "🚨 <b>Дорожная обстановка (Иваново):</b>\n"
-    
-    # Если погода плохая и есть ДТП - выводим предупреждение
     if is_bad_weather and unique_news:
         text += "⚠️ <i>Погода ухудшает ситуацию. Будьте внимательнее на дорогах!</i>\n"
     text += "\n"
     
     for news in unique_news[:4]:
-        news_text = news[0].upper() + news[1:]
+        news_text = news["title"][0].upper() + news["title"][1:]
+        if news_text.endswith('.'): news_text = news_text[:-1]
+        
         street = extract_street(news_text)
         impact = infer_traffic_impact(news_text)
-        
-        if news_text.endswith('.'):
-            news_text = news_text[:-1]
+        time_str = news["time"]
 
         text += f"📝 <b>Событие:</b> {news_text}.\n"
+        text += f"🕒 <b>Время:</b> {time_str}.\n"
         text += f"📍 <b>Локация:</b> {street}.\n"
         text += f"🚦 <b>Влияние:</b> {impact}\n"
         text += "➖➖➖➖➖➖➖➖\n"
@@ -226,8 +261,7 @@ async def cmd_all(message: types.Message):
 
 
 async def main():
-    moscow_tz = pytz.timezone("Europe/Moscow")
-    scheduler = AsyncIOScheduler(timezone=moscow_tz)
+    scheduler = AsyncIOScheduler(timezone=MSK_TZ)
     scheduler.add_job(morning_broadcast, trigger='cron', hour=5, minute=0)
     scheduler.start()
     

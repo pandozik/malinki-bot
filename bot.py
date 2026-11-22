@@ -212,8 +212,8 @@ async def get_fuel_situation_news():
     for news in found_news[:3]:
         text += f"🔸 {news}\n\n"
     return text
-
-# --- Погода ---
+    
+# --- Погода (Единый источник Open-Meteo) ---
 def get_weather_emoji(code):
     if code in [0, 1]: return "☀️"
     if code in [2, 3]: return "☁️"
@@ -226,70 +226,93 @@ def get_weather_emoji(code):
     if code in [95, 96, 99]: return "⛈"
     return "🌡"
 
+def get_wmo_description(code):
+    """Текстовое описание погоды по коду WMO для Open-Meteo"""
+    if code in [0, 1]: return "Ясно"
+    if code in [2]: return "Переменная облачность"
+    if code in [3]: return "Пасмурно"
+    if code in [45, 48]: return "Туман"
+    if code in [51, 53, 55, 56, 57]: return "Морось"
+    if code in [61, 63, 65, 66, 67]: return "Дождь"
+    if code in [71, 73, 75, 77]: return "Снег"
+    if code in [80, 81, 82]: return "Ливень"
+    if code in [85, 86]: return "Снегопад"
+    if code in [95, 96, 99]: return "Гроза"
+    return "Облачно"
+
+def get_road_condition_wmo(code, temp):
+    """Оценка дорожных условий по коду WMO"""
+    if code in [71, 73, 75, 77, 85, 86]: 
+        return "❄️ Снегопад. Дороги скользкие, возможны заносы.", True
+    elif code in [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]:
+        if temp < 2: return "🌧 Гололедица. Мокрый асфальт замерзает. Высокий риск ДТП!", True
+        return "🌧 Мокрый асфальт. Тормозной путь увеличен.", True
+    elif code in [45, 48]: 
+        return "🌫 Плохая видимость. Соблюдайте дистанцию.", True
+    elif temp < -5: 
+        return "🧊 Сильный мороз. На дорогах возможна наледь.", True
+    elif temp > 25: 
+        return "☀️ Жарко. Дороги сухие.", False
+    return "✅ Дороги сухие, видимость хорошая.", False
+
+async def get_weather_ivanovo():
+    """Детальная погода для Иваново (источник: Open-Meteo)"""
+    lat, lon = REGION_CITIES["Иваново"]
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,apparent_temperature,precipitation_probability,weather_code&timezone=Europe/Moscow"
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200: return "⚠️ Ошибка сервера погоды.", False
+                data = await resp.json()
+                current = data.get("current", {})
+                
+                temp = current.get("temperature_2m", 0)
+                feels = current.get("apparent_temperature", 0)
+                code = current.get("weather_code", 0)
+                prob = current.get("precipitation_probability", 0)
+                
+                desc = get_wmo_description(code)
+                emoji = get_weather_emoji(code)
+                road, is_bad = get_road_condition_wmo(code, temp)
+                
+                text = (f"{emoji} <b>Погода в Иваново:</b>\n"
+                        f"🌡 Температура: <b>{temp:+.1f}°C</b> (ощущается {feels:+.1f}°C)\n"
+                        f"☁️ {desc}\n"
+                        f"💧 Вероятность осадков: {prob}%\n"
+                        f"🛣 <b>Дорога:</b> {road}")
+                return text, is_bad
+        except Exception as e:
+            print(f"Ошибка погоды Иваново: {e}")
+            return "⚠️ Ошибка сети при запросе погоды.", False
+
 async def get_region_weather(user_cities: list):
     selected_cities = {city: REGION_CITIES[city] for city in user_cities if city in REGION_CITIES}
-    if not selected_cities: return "⚠️ Вы не выбрали ни одного города. Зайдите в /settings."
+    if not selected_cities:
+        return "⚠️ Вы не выбрали ни одного города. Зайдите в /settings."
 
     lats = ",".join(str(lat) for lat, lon in selected_cities.values())
     lons = ",".join(str(lon) for lat, lon in selected_cities.values())
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&current=temperature_2m,precipitation_probability,weather_code&timezone=Europe/Moscow"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&current=temperature_2m,apparent_temperature,precipitation_probability,weather_code&timezone=Europe/Moscow"
     
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=10) as resp:
                 data = await resp.json()
                 if isinstance(data, dict): data = [data]
+                
                 lines = []
                 for i, city in enumerate(selected_cities.keys()):
                     if i < len(data):
                         current = data[i].get("current", {})
-                        lines.append(f"{get_weather_emoji(current.get('weather_code', 0))} <b>{city}</b>: {current.get('temperature_2m', 0):+.0f}°C, 💧{current.get('precipitation_probability', 0)}%")
+                        temp = current.get("temperature_2m", 0)
+                        prob = current.get("precipitation_probability", 0)
+                        code = current.get("weather_code", 0)
+                        lines.append(f"{get_weather_emoji(code)} <b>{city}</b>: {temp:+.1f}°C, 💧{prob}%")
                 return "🌍 <b>Погода в выбранных городах:</b>\n" + "\n".join(lines)
-        except Exception:
+        except Exception as e:
+            print(f"Ошибка региона: {e}")
             return "⚠️ Ошибка при запросе к сервису."
-
-def get_road_condition(temp, desc, wind):
-    desc = desc.lower()
-    if "снег" in desc: return "❄️ Снегопад. Дороги скользкие.", True
-    elif "дождь" in desc:
-        if temp < 2: return "🌧 Гололедица. Высокий риск ДТП!", True
-        return "🌧 Мокрый асфальт. Тормозной путь увеличен.", True
-    elif "туман" in desc: return "🌫 Плохая видимость.", True
-    elif temp < -5: return "🧊 Наледь на дорогах.", True
-    elif temp > 25: return "☀️ Жарко. Дороги сухие.", False
-    elif "ясно" in desc or "облачно" in desc: return "✅ Дороги сухие.", False
-    return "⚪ Стандартные условия.", False
-
-async def get_weather_ivanovo():
-    url = f"https://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status != 200: return "⚠️ Ошибка погоды.", False
-            data = await resp.json()
-            temp = data["main"]["temp"]
-            feels = data["main"]["feels_like"]
-            desc = data["weather"][0]["description"].capitalize()
-            wind = data["wind"]["speed"]
-            emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
-            road, is_bad = get_road_condition(temp, desc, wind)
-            text = (f"{emoji} <b>Погода в {CITY_NAME}:</b>\n"
-                    f"🌡 Температура: <b>{temp:+.0f}°C</b> (ощущается {feels:+.0f}°C)\n"
-                    f"☁️ {desc}\n💨 Ветер: {wind} м/с\n🛣 <b>Дорога:</b> {road}")
-            return text, is_bad
-
-def get_cities_keyboard(user_cities: list):
-    keyboard = []
-    row = []
-    for city in REGION_CITIES.keys():
-        btn_text = f"✅ {city}" if city in user_cities else city
-        row.append(InlineKeyboardButton(text=btn_text, callback_data=f"toggle_{city}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row: keyboard.append(row)
-    keyboard.append([InlineKeyboardButton(text="💾 Сохранить и выйти", callback_data="save_settings")])
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
 # --- Маршруты ---
 async def get_coords(session, address):
     query = address if any(city.lower() in address.lower() for city in REGION_CITIES.keys()) else f"Иваново, {address}"

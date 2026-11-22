@@ -6,7 +6,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
-# Импорты для планировщика
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 from datetime import datetime
@@ -21,8 +20,6 @@ CITY_NAME = "Иваново"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-# Хранилище подписчиков (в оперативной памяти, сбрасывается при перезапуске)
 SUBSCRIBERS = set()
 
 # --- Погода ---
@@ -31,18 +28,22 @@ async def get_weather():
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status != 200:
-                return "Не удалось получить погоду."
+                return "⚠️ Не удалось получить погоду."
             data = await resp.json()
             temp = data["main"]["temp"]
             feels = data["main"]["feels_like"]
             desc = data["weather"][0]["description"].capitalize()
             wind = data["wind"]["speed"]
-            return (f"🌡 Погода в {CITY_NAME}:\n"
-                    f"Температура: {temp:+.0f}°C (ощущается {feels:+.0f}°C)\n"
-                    f"{desc}\n"
-                    f"Ветер: {wind} м/с")
+            
+            # Подбираем эмодзи под погоду
+            emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
+            
+            return (f"{emoji} Погода в {CITY_NAME}:\n"
+                    f"🌡 Температура: {temp:+.0f}°C (ощущается {feels:+.0f}°C)\n"
+                    f"☁️ {desc}\n"
+                    f"💨 Ветер: {wind} м/с")
 
-# --- ДТП и заторы (мультиисточники) ---
+# --- ДТП и заторы ---
 async def fetch_news(session, url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -53,17 +54,17 @@ async def fetch_news(session, url):
             soup = BeautifulSoup(html, "html.parser")
             keywords = ["дтп", "авари", "пробк", "затор", "столкновен", "перекрыт"]
             found = []
-            # Ищем в заголовках и ссылках
+            
             for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
                 text = tag.get_text(strip=True)
-                if any(kw in text.lower() for kw in keywords) and len(text) > 15:
+                # Фильтр "воды": берем только заголовки длиной от 20 до 110 символов
+                if 20 < len(text) < 110 and any(kw in text.lower() for kw in keywords):
                     found.append(text)
             return found
     except Exception:
         return []
 
 async def get_accidents():
-    # Список источников: RSS и HTML главные страницы
     sources = [
         "https://newsivanovo.ru/rss",
         "https://ivanovonews.ru/rss/",
@@ -79,11 +80,22 @@ async def get_accidents():
             all_news.extend(res)
             
     if not all_news:
-        return "Свежих сообщений о ДТП и заторах в Иваново не найдено."
+        return "✅ Свежих сообщений о ДТП и заторах в Иваново не найдено."
         
-    # Убираем дубликаты и ограничиваем до 7 самых свежих
-    unique_news = list(dict.fromkeys(all_news))[:7]
-    return "🚨 Дорожная обстановка (Иваново):\n" + "\n".join(f"— {t}" for t in unique_news)
+    # Умная дедупликация (ищем частичные совпадения текста)
+    unique_news = []
+    for news in all_news:
+        # Если новость не является частью уже добавленной и наоборот
+        if not any(news.lower() in existing.lower() or existing.lower() in news.lower() for existing in unique_news):
+            unique_news.append(news)
+            
+    # Берем только 5 самых свежих уникальных
+    final_news = unique_news[:5]
+    
+    text = "🚦 Дорожная обстановка (Иваново):\n"
+    for item in final_news:
+        text += f"🚨 {item}\n"
+    return text
 
 # --- Утренняя рассылка ---
 async def morning_broadcast():
@@ -92,32 +104,31 @@ async def morning_broadcast():
     
     weather = await get_weather()
     traffic = await get_accidents()
-    text = f"☀️ Доброе утро! Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather}\n\n{traffic}"
+    text = f"🌅 Доброе утро! Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather}\n\n{traffic}"
     
     for chat_id in list(SUBSCRIBERS):
         try:
             await bot.send_message(chat_id, text)
         except Exception:
-            # Если пользователь заблокировал бота — удаляем из списка
             SUBSCRIBERS.discard(chat_id)
 
 # --- Хэндлеры ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        f"Привет! Я слежу за погодой и дорожной обстановкой в {CITY_NAME}.\n"
-        "Команды:\n"
+        f"👋 Привет! Я слежу за погодой и дорожной обстановкой в {CITY_NAME}.\n\n"
+        "📋 Команды:\n"
         "/weather — погода\n"
         "/traffic — пробки и ДТП\n"
         "/all — всё сразу\n"
         "/subscribe — подписаться на утреннюю сводку (05:00 МСК)\n"
-        "/unsubscribe — отписаться от рассылки"
+        "/unsubscribe — отписаться"
     )
 
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: types.Message):
     SUBSCRIBERS.add(message.chat.id)
-    await message.answer("✅ Вы подписаны на утреннюю сводку. Бот пришлет её завтра в 05:00 по Москве.")
+    await message.answer("✅ Вы подписаны на утреннюю сводку! Бот пришлет её завтра в 05:00 по Москве.")
 
 @dp.message(Command("unsubscribe"))
 async def cmd_unsubscribe(message: types.Message):
@@ -140,11 +151,8 @@ async def cmd_all(message: types.Message):
 
 
 async def main():
-    # Настройка планировщика (МСК)
     moscow_tz = pytz.timezone("Europe/Moscow")
     scheduler = AsyncIOScheduler(timezone=moscow_tz)
-    
-    # Запуск каждый день в 05:00
     scheduler.add_job(morning_broadcast, trigger='cron', hour=5, minute=0)
     scheduler.start()
     

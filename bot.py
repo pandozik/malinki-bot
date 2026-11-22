@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -98,6 +98,17 @@ class RouteState(StatesGroup):
     waiting_for_start = State()
     waiting_for_end = State()
 
+# --- Главное меню ---
+def get_main_menu():
+    # Нижняя клавиатура с кнопками
+    keyboard = [
+        [KeyboardButton(text="🌤 Погода"), KeyboardButton(text="🌍 Города")],
+        [KeyboardButton(text="🚦 ДТП"), KeyboardButton(text="⛽ Бензин")],
+        [KeyboardButton(text="🗺 Маршрут"), KeyboardButton(text="🗂 Всё сразу")],
+        [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="⏰ Рассылка")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
 # --- Цены на топливо ---
 def format_price_with_delta(name, current, previous):
     if not previous or current is None:
@@ -169,17 +180,9 @@ async def get_fuel_prices(show_delta=False):
 
 # --- Мониторинг ситуации с топливом (новости) ---
 async def get_fuel_situation_news():
-    """Парсит новости о ситуации с топливом в регионе"""
-    sources = [
-        "https://newsivanovo.ru/rss",
-        "https://ivanovonews.ru/rss/",
-        "https://mkivanovo.ru/",
-        "https://iv-news.ru/"
-    ]
-    
+    sources = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
     keywords = ["дефицит", "бензин", "топливо", "азс", "заправк", "очеред", "лимит", "ограничен"]
     stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
-    
     found_news = []
     
     async with aiohttp.ClientSession() as session:
@@ -187,36 +190,27 @@ async def get_fuel_situation_news():
             try:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
                 async with session.get(url, headers=headers, timeout=8) as resp:
-                    if resp.status != 200:
-                        continue
+                    if resp.status != 200: continue
                     html = await resp.text()
                     soup = BeautifulSoup(html, "html.parser")
-                    
                     items = soup.find_all('item')
                     for item in items:
                         title_tag = item.find('title')
                         if not title_tag: continue
                         text = title_tag.get_text(strip=True)
                         lower_text = text.lower()
-                        
-                        # Ищем новости про топливо
                         if any(kw in lower_text for kw in keywords):
                             if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
                                 if not any(sw in lower_text for sw in stop_words):
-                                    # Проверяем на дубли
                                     if not any(text.lower() in ex.lower() or ex.lower() in text.lower() for ex in found_news):
                                         found_news.append(text)
             except Exception:
                 continue
     
-    if not found_news:
-        return None
-    
-    # Берём только 3 самые свежие уникальные новости
+    if not found_news: return None
     text = "📰 <b>Ситуация с топливом (новости):</b>\n\n"
     for news in found_news[:3]:
         text += f"🔸 {news}\n\n"
-    
     return text
 
 # --- Погода ---
@@ -234,8 +228,7 @@ def get_weather_emoji(code):
 
 async def get_region_weather(user_cities: list):
     selected_cities = {city: REGION_CITIES[city] for city in user_cities if city in REGION_CITIES}
-    if not selected_cities:
-        return "⚠️ Вы не выбрали ни одного города. Зайдите в /settings."
+    if not selected_cities: return "⚠️ Вы не выбрали ни одного города. Зайдите в /settings."
 
     lats = ",".join(str(lat) for lat, lon in selected_cities.values())
     lons = ",".join(str(lon) for lat, lon in selected_cities.values())
@@ -441,58 +434,83 @@ async def morning_broadcast():
         user_cities = get_user_cities(user_id)
         full_text = (f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n"
                      f"{weather_text}\n\n{await get_region_weather(user_cities)}\n\n{fuel_text}\n\n")
-        if fuel_news:
-            full_text += f"{fuel_news}\n"
+        if fuel_news: full_text += f"{fuel_news}\n"
         full_text += f"{await get_traffic_summary(is_bad, user_cities)}"
         try: await bot.send_message(user_id, full_text, parse_mode="HTML")
         except Exception: pass
 
-# --- Хэндлеры ---
+# --- Обработчики команд и кнопок ---
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("👋 Привет! Я слежу за обстановкой.\n\n/weather — погода 🌤\n/region — города 🌍\n/fuel — бензин и новости ⛽\n/settings — настройки ⚙️\n/traffic — ДТП 🚦\n/all — всё 🗂\n/route — маршрут 🗺\n/subscribe — рассылка ⏰\n/unsubscribe — стоп 🔕", parse_mode="HTML")
+    await message.answer(
+        "👋 Привет! Я слежу за обстановкой в регионе.\n"
+        "Пользуйся кнопками внизу экрана для управления 👇",
+        reply_markup=get_main_menu()
+    )
 
+@dp.message(F.text == "🌤 Погода")
+@dp.message(Command("weather"))
+async def cmd_weather(message: types.Message): 
+    await message.answer((await get_weather_ivanovo())[0], parse_mode="HTML")
+
+@dp.message(F.text == "🌍 Города")
+@dp.message(Command("region"))
+async def cmd_region(message: types.Message): 
+    await message.answer(await get_region_weather(get_user_cities(message.from_user.id)), parse_mode="HTML")
+
+@dp.message(F.text == "⛽ Бензин")
 @dp.message(Command("fuel"))
 async def cmd_fuel(message: types.Message):
     prices = await get_fuel_prices(False)
     news = await get_fuel_situation_news()
     text = prices
-    if news:
-        text += f"\n\n{news}"
+    if news: text += f"\n\n{news}"
     await message.answer(text, parse_mode="HTML")
 
+@dp.message(F.text == "🚦 ДТП")
+@dp.message(Command("traffic"))
+async def cmd_traffic(message: types.Message): 
+    await message.answer(await get_traffic_summary((await get_weather_ivanovo())[1], get_user_cities(message.from_user.id)), parse_mode="HTML")
+
+@dp.message(F.text == "🗂 Всё сразу")
+@dp.message(Command("all"))
+async def cmd_all(message: types.Message):
+    weather_text, is_bad = await get_weather_ivanovo()
+    fuel_news = await get_fuel_situation_news()
+    text = (f"{weather_text}\n\n{await get_region_weather(get_user_cities(message.from_user.id))}\n\n{await get_fuel_prices(True)}\n\n")
+    if fuel_news: text += f"{fuel_news}\n"
+    text += f"{await get_traffic_summary(is_bad, get_user_cities(message.from_user.id))}"
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(F.text == "⚙️ Настройки")
 @dp.message(Command("settings"))
-async def cmd_settings(message: types.Message): await message.answer("⚙️ <b>Настройка городов</b>", reply_markup=get_cities_keyboard(get_user_cities(message.from_user.id)), parse_mode="HTML")
+async def cmd_settings(message: types.Message): 
+    await message.answer("⚙️ <b>Настройка городов</b>\nВыберите города для отслеживания:", reply_markup=get_cities_keyboard(get_user_cities(message.from_user.id)), parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("toggle_"))
-async def process_toggle_city(callback: CallbackQuery):
-    city = callback.data.split("_")[1]
-    user_cities = get_user_cities(callback.from_user.id)
-    if city in user_cities: user_cities.remove(city)
-    else: user_cities.append(city)
-    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(user_cities))
-    await callback.answer()
+@dp.message(F.text == "⏰ Рассылка")
+async def menu_subscribe(message: types.Message):
+    user_id = message.from_user.id
+    subscribers = get_subscribers()
+    if user_id in subscribers:
+        conn = sqlite3.connect("users.db")
+        conn.execute("DELETE FROM user_settings WHERE user_id = ?", (user_id,))
+        conn.commit(); conn.close()
+        await message.answer("❌ Вы отписались от утренней рассылки в 05:00.")
+    else:
+        save_user_cities(user_id, get_user_cities(user_id))
+        await message.answer("✅ Вы подписались на утреннюю сводку в 05:00 по МСК!")
 
-@dp.callback_query(F.data == "save_settings")
-async def process_save_settings(callback: CallbackQuery):
-    selected_cities = [btn.text.replace("✅ ", "") for row in callback.message.reply_markup.inline_keyboard for btn in row if btn.text.startswith("✅")]
-    save_user_cities(callback.from_user.id, selected_cities)
-    await callback.message.edit_text("✅ Настройки сохранены!")
-    await callback.answer()
-
-@dp.message(Command("region"))
-async def cmd_region(message: types.Message): await message.answer(await get_region_weather(get_user_cities(message.from_user.id)), parse_mode="HTML")
-
-@dp.message(Command("route"))
-async def cmd_route(message: types.Message, state: FSMContext):
+@dp.message(F.text == "🗺 Маршрут")
+async def menu_route(message: types.Message, state: FSMContext):
     await state.set_state(RouteState.waiting_for_start)
-    await message.answer("🗺 <b>Откуда выезжаете?</b>", parse_mode="HTML")
+    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или город.", parse_mode="HTML")
 
 @dp.message(RouteState.waiting_for_start)
 async def process_route_start(message: types.Message, state: FSMContext):
     await state.update_data(start_point=message.text)
     await state.set_state(RouteState.waiting_for_end)
-    await message.answer("🏁 <b>Куда едем?</b>")
+    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес или город.")
 
 @dp.message(RouteState.waiting_for_end)
 async def process_route_end(message: types.Message, state: FSMContext):
@@ -512,33 +530,22 @@ async def process_route_end(message: types.Message, state: FSMContext):
     time_str = f"{total_min // 60} ч {total_min % 60} мин"
     await wait_msg.edit_text(f"🗺 <b>Маршрут:</b>\n{start_point.capitalize()} ➡️ {end_point.capitalize()}\n📏 {dist_km:.1f} км\n⏱ {time_str}", parse_mode="HTML")
 
-@dp.message(Command("subscribe"))
-async def cmd_subscribe(message: types.Message):
-    save_user_cities(message.from_user.id, get_user_cities(message.from_user.id))
-    await message.answer("✅ Вы подписаны на 05:00!")
+# --- Обработчики инлайн-клавиатуры ---
+@dp.callback_query(F.data.startswith("toggle_"))
+async def process_toggle_city(callback: CallbackQuery):
+    city = callback.data.split("_")[1]
+    user_cities = get_user_cities(callback.from_user.id)
+    if city in user_cities: user_cities.remove(city)
+    else: user_cities.append(city)
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(user_cities))
+    await callback.answer()
 
-@dp.message(Command("unsubscribe"))
-async def cmd_unsubscribe(message: types.Message):
-    conn = sqlite3.connect("users.db")
-    conn.execute("DELETE FROM user_settings WHERE user_id = ?", (message.from_user.id,))
-    conn.commit(); conn.close()
-    await message.answer("❌ Отписано.")
-
-@dp.message(Command("weather"))
-async def cmd_weather(message: types.Message): await message.answer((await get_weather_ivanovo())[0], parse_mode="HTML")
-
-@dp.message(Command("traffic"))
-async def cmd_traffic(message: types.Message): await message.answer(await get_traffic_summary((await get_weather_ivanovo())[1], get_user_cities(message.from_user.id)), parse_mode="HTML")
-
-@dp.message(Command("all"))
-async def cmd_all(message: types.Message):
-    weather_text, is_bad = await get_weather_ivanovo()
-    fuel_news = await get_fuel_situation_news()
-    text = (f"{weather_text}\n\n{await get_region_weather(get_user_cities(message.from_user.id))}\n\n{await get_fuel_prices(True)}\n\n")
-    if fuel_news:
-        text += f"{fuel_news}\n"
-    text += f"{await get_traffic_summary(is_bad, get_user_cities(message.from_user.id))}"
-    await message.answer(text, parse_mode="HTML")
+@dp.callback_query(F.data == "save_settings")
+async def process_save_settings(callback: CallbackQuery):
+    selected_cities = [btn.text.replace("✅ ", "") for row in callback.message.reply_markup.inline_keyboard for btn in row if btn.text.startswith("✅")]
+    save_user_cities(callback.from_user.id, selected_cities)
+    await callback.message.edit_text("✅ Настройки сохранены!")
+    await callback.answer()
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)

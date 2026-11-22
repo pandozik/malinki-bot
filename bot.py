@@ -38,15 +38,14 @@ async def get_weather():
             
             emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
             
-            return (f"{emoji} <b>Погода в {CITY_NAME}:</b>\n"
-                    f"🌡 Температура: <b>{temp:+.0f}°C</b> (ощущается {feels:+.0f}°C)\n"
+            return (f"{emoji} Погода в {CITY_NAME}:\n"
+                    f"🌡 Температура: {temp:+.0f}°C (ощущается {feels:+.0f}°C)\n"
                     f"☁️ {desc}\n"
                     f"💨 Ветер: {wind} м/с")
 
-# --- ДТП и заторы ---
+# --- Парсинг новостей ---
 def extract_street(text):
-    """Пытается вытащить улицу из текста"""
-    # Ищем паттерны: "ул. Название", "улица Название", "на Название"
+    """Пытается вытащить улицу из текста для выделения"""
     patterns = [
         r'ул(?:ица|\.)?\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
         r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
@@ -57,17 +56,6 @@ def extract_street(text):
             return match.group(1)
     return None
 
-def get_status(text):
-    """Определяет статус по ключевым словам"""
-    lower = text.lower()
-    if "перекрыт" in lower or "закрыт" in lower:
-        return "🔴 Перекрыто"
-    if "пробка" in lower or "затор" in lower or "стоит" in lower:
-        return "🟠 Затруднено"
-    if "дтп" in lower or "авари" in lower:
-        return "🟡 ДТП"
-    return "⚪ Инфо"
-
 async def fetch_news(session, url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -77,7 +65,7 @@ async def fetch_news(session, url):
             html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
             
-            keywords = ["дтп", "авария", "аварии", "пробка", "пробки", "затор", "столкновение", "перекрыт"]
+            keywords = ["дтп", "авария", "аварии", "пробка", "пробки", "затор", "столкновение", "перекрыт", "вылет"]
             stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
             
             found = []
@@ -85,11 +73,14 @@ async def fetch_news(session, url):
                 text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
                 lower_text = text.lower()
                 
-                if not (20 <= len(text) <= 100):
+                # Фильтр длины
+                if not (25 <= len(text) <= 110):
                     continue
+                # Проверка на ключевые слова
                 if not any(kw in lower_text for kw in keywords):
                     continue
-                if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
+                # Локальный контекст и отсутствие стоп-слов
+                if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text or "лежневск" in lower_text):
                     if not any(sw in lower_text for sw in stop_words):
                         found.append(text)
             return found
@@ -113,8 +104,8 @@ async def get_traffic_summary():
             
     if not all_news:
         return "✅ <b>Свежих сообщений о ДТП и заторах в Иваново не найдено.</b>"
-    
-    # Дедупликация по пересечению слов
+        
+    # Умная дедупликация
     unique_news = []
     for news in all_news:
         words_new = set(w.strip(".,!?\"'()-") for w in news.lower().split() if len(w) > 3)
@@ -127,38 +118,25 @@ async def get_traffic_summary():
         if not is_dup:
             unique_news.append(news)
     
-    # Формируем структурированный список
-    incidents = []
-    has_major_jam = False
-    
-    for news in unique_news[:6]:
-        street = extract_street(news)
-        status = get_status(news)
-        if status == "🔴 Перекрыто" or status == "🟠 Затруднено":
-            has_major_jam = True
+    # Формируем красивый список
+    text = "🚨 <b>Дорожная обстановка (Иваново):</b>\n\n"
+    count = 0
+    for news in unique_news:
+        if count >= 5: 
+            break
+            
+        # Делаем первую букву заглавной
+        news_text = news[0].upper() + news[1:]
         
-        # Очищаем текст от лишнего, оставляем суть
-        summary = news
-        if len(summary) > 80:
-            summary = summary[:77] + "..."
-        
+        # Выделяем улицу жирным, если нашли
+        street = extract_street(news_text)
         if street:
-            incidents.append(f"{status} <b>ул. {street}</b>\n   <i>{summary}</i>")
-        else:
-            incidents.append(f"{status} <i>{summary}</i>")
-    
-    # Определяем общий уровень (эвристика)
-    if has_major_jam:
-        level = "🟠 <b>Затруднено</b> (есть перекрытия/заторы)"
-    elif incidents:
-        level = "🟡 <b>Небольшие осложнения</b>"
-    else:
-        level = "🟢 <b>Свободно</b>"
-    
-    text = "🚦 <b>Дорожная обстановка (Иваново):</b>\n\n"
-    text += f"📊 Уровень: {level}\n\n"
-    text += "\n\n".join(incidents)
-    
+            # Заменяем упоминание улицы на жирное
+            news_text = re.sub(fr'\b{street}\b', f'<b>{street}</b>', news_text, count=1)
+        
+        text += f"— {news_text}\n"
+        count += 1
+
     return text
 
 # --- Утренняя рассылка ---

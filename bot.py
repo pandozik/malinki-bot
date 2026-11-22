@@ -98,7 +98,7 @@ class RouteState(StatesGroup):
     waiting_for_start = State()
     waiting_for_end = State()
 
-# --- Получение цен на бензин ---
+# --- Цены на топливо ---
 def format_price_with_delta(name, current, previous):
     if not previous or current is None:
         return f"🔹 <b>{name}:</b> {current} ₽/л\n" if current else ""
@@ -166,6 +166,58 @@ async def get_fuel_prices(show_delta=False):
     except Exception as e:
         print(f"Ошибка топлива: {e}")
         return "⚠️ Ошибка сети при запросе цен."
+
+# --- Мониторинг ситуации с топливом (новости) ---
+async def get_fuel_situation_news():
+    """Парсит новости о ситуации с топливом в регионе"""
+    sources = [
+        "https://newsivanovo.ru/rss",
+        "https://ivanovonews.ru/rss/",
+        "https://mkivanovo.ru/",
+        "https://iv-news.ru/"
+    ]
+    
+    keywords = ["дефицит", "бензин", "топливо", "азс", "заправк", "очеред", "лимит", "ограничен"]
+    stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ"]
+    
+    found_news = []
+    
+    async with aiohttp.ClientSession() as session:
+        for url in sources:
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                async with session.get(url, headers=headers, timeout=8) as resp:
+                    if resp.status != 200:
+                        continue
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    
+                    items = soup.find_all('item')
+                    for item in items:
+                        title_tag = item.find('title')
+                        if not title_tag: continue
+                        text = title_tag.get_text(strip=True)
+                        lower_text = text.lower()
+                        
+                        # Ищем новости про топливо
+                        if any(kw in lower_text for kw in keywords):
+                            if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
+                                if not any(sw in lower_text for sw in stop_words):
+                                    # Проверяем на дубли
+                                    if not any(text.lower() in ex.lower() or ex.lower() in text.lower() for ex in found_news):
+                                        found_news.append(text)
+            except Exception:
+                continue
+    
+    if not found_news:
+        return None
+    
+    # Берём только 3 самые свежие уникальные новости
+    text = "📰 <b>Ситуация с топливом (новости):</b>\n\n"
+    for news in found_news[:3]:
+        text += f"🔸 {news}\n\n"
+    
+    return text
 
 # --- Погода ---
 def get_weather_emoji(code):
@@ -270,7 +322,7 @@ async def get_route_info(session, start_coords, end_coords):
     except Exception: pass
     return None
 
-# --- Анализ новостей ---
+# --- Анализ новостей (ДТП) ---
 def extract_street(text):
     patterns = [r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)', r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:ой|ий|ая|ое|ые))', r'\b([А-ЯЁ][а-яё]+ская)\b']
     for pattern in patterns:
@@ -383,20 +435,31 @@ async def morning_broadcast():
     if not subscribers: return
     weather_text, is_bad = await get_weather_ivanovo()
     fuel_text = await get_fuel_prices(show_delta=True)
+    fuel_news = await get_fuel_situation_news()
+    
     for user_id in subscribers:
         user_cities = get_user_cities(user_id)
         full_text = (f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n"
-                     f"{weather_text}\n\n{await get_region_weather(user_cities)}\n\n{fuel_text}\n\n{await get_traffic_summary(is_bad, user_cities)}")
+                     f"{weather_text}\n\n{await get_region_weather(user_cities)}\n\n{fuel_text}\n\n")
+        if fuel_news:
+            full_text += f"{fuel_news}\n"
+        full_text += f"{await get_traffic_summary(is_bad, user_cities)}"
         try: await bot.send_message(user_id, full_text, parse_mode="HTML")
         except Exception: pass
 
 # --- Хэндлеры ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("👋 Привет! Я слежу за обстановкой.\n\n/weather — погода 🌤\n/region — города 🌍\n/fuel — бензин ⛽\n/settings — настройки ⚙️\n/traffic — ДТП 🚦\n/all — всё 🗂\n/route — маршрут 🗺\n/subscribe — рассылка ⏰\n/unsubscribe — стоп 🔕", parse_mode="HTML")
+    await message.answer("👋 Привет! Я слежу за обстановкой.\n\n/weather — погода 🌤\n/region — города 🌍\n/fuel — бензин и новости ⛽\n/settings — настройки ⚙️\n/traffic — ДТП 🚦\n/all — всё 🗂\n/route — маршрут 🗺\n/subscribe — рассылка ⏰\n/unsubscribe — стоп 🔕", parse_mode="HTML")
 
 @dp.message(Command("fuel"))
-async def cmd_fuel(message: types.Message): await message.answer(await get_fuel_prices(False), parse_mode="HTML")
+async def cmd_fuel(message: types.Message):
+    prices = await get_fuel_prices(False)
+    news = await get_fuel_situation_news()
+    text = prices
+    if news:
+        text += f"\n\n{news}"
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message): await message.answer("⚙️ <b>Настройка городов</b>", reply_markup=get_cities_keyboard(get_user_cities(message.from_user.id)), parse_mode="HTML")
@@ -470,7 +533,12 @@ async def cmd_traffic(message: types.Message): await message.answer(await get_tr
 @dp.message(Command("all"))
 async def cmd_all(message: types.Message):
     weather_text, is_bad = await get_weather_ivanovo()
-    await message.answer(f"{weather_text}\n\n{await get_region_weather(get_user_cities(message.from_user.id))}\n\n{await get_fuel_prices(True)}\n\n{await get_traffic_summary(is_bad, get_user_cities(message.from_user.id))}", parse_mode="HTML")
+    fuel_news = await get_fuel_situation_news()
+    text = (f"{weather_text}\n\n{await get_region_weather(get_user_cities(message.from_user.id))}\n\n{await get_fuel_prices(True)}\n\n")
+    if fuel_news:
+        text += f"{fuel_news}\n"
+    text += f"{await get_traffic_summary(is_bad, get_user_cities(message.from_user.id))}"
+    await message.answer(text, parse_mode="HTML")
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)

@@ -3,8 +3,10 @@ import asyncio
 import aiohttp
 import re
 from bs4 import BeautifulSoup
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from dotenv import load_dotenv
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,31 +27,29 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 SUBSCRIBERS = set()
 
+# --- Состояния для маршрута ---
+class RouteState(StatesGroup):
+    waiting_for_start = State()
+    waiting_for_end = State()
+
 # --- Погода ---
 def get_road_condition(temp, desc, wind):
     desc = desc.lower()
-    if "снег" in desc:
-        return "❄️ Снегопад. Дороги скользкие, возможны заносы. Будьте осторожны!"
+    if "снег" in desc: return "❄️ Снегопад. Дороги скользкие."
     elif "дождь" in desc:
-        if temp < 2:
-            return "🌧 Гололедица. Мокрый асфальт замерзает. Высокий риск ДТП!"
+        if temp < 2: return "🌧 Гололедица. Высокий риск ДТП!"
         return "🌧 Мокрый асфальт. Тормозной путь увеличен."
-    elif "туман" in desc or "дымка" in desc:
-        return "🌫 Плохая видимость. Соблюдайте дистанцию."
-    elif temp < -5:
-        return "🧊 Сильный мороз. На дорогах возможна наледь."
-    elif temp > 25:
-        return "☀️ Жарко. Дороги сухие, но возможна усталость за рулем."
-    elif "ясно" in desc or "облачно" in desc:
-        return "✅ Дороги сухие, видимость хорошая."
-    return "⚪ Дорожные условия стандартные."
+    elif "туман" in desc: return "🌫 Плохая видимость."
+    elif temp < -5: return "🧊 Наледь на дорогах."
+    elif temp > 25: return "☀️ Жарко. Дороги сухие."
+    elif "ясно" in desc or "облачно" in desc: return "✅ Дороги сухие."
+    return "⚪ Стандартные условия."
 
 async def get_weather():
     url = f"https://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
-            if resp.status != 200:
-                return "⚠️ Не удалось получить погоду.", False
+            if resp.status != 200: return "⚠️ Ошибка погоды.", False
             data = await resp.json()
             temp = data["main"]["temp"]
             feels = data["main"]["feels_like"]
@@ -57,71 +57,89 @@ async def get_weather():
             wind = data["wind"]["speed"]
             
             emoji = "☀️" if "ясно" in desc.lower() else "☁️" if "облач" in desc.lower() else "🌧" if "дождь" in desc.lower() else "🌡"
-            road_condition = get_road_condition(temp, desc, wind)
-            is_bad_weather = any(w in desc.lower() for w in ["снег", "дождь", "туман"]) or temp < 2
+            road = get_road_condition(temp, desc, wind)
+            is_bad = any(w in desc.lower() for w in ["снег", "дождь", "туман"]) or temp < 2
             
             text = (f"{emoji} <b>Погода в {CITY_NAME}:</b>\n"
                     f"🌡 Температура: <b>{temp:+.0f}°C</b> (ощущается {feels:+.0f}°C)\n"
                     f"☁️ {desc}\n"
                     f"💨 Ветер: {wind} м/с\n"
-                    f"🛣 <b>Дорога:</b> {road_condition}")
-            return text, is_bad_weather
+                    f"🛣 <b>Дорога:</b> {road}")
+            return text, is_bad
 
-# --- Улучшенный анализ локации ---
+# --- Маршруты (Карты) ---
+async def get_coords(session, address):
+    """Получает координаты по адресу (привязка к Иваново)"""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": f"Иваново, {address}",
+        "format": "json",
+        "limit": 1
+    }
+    headers = {"User-Agent": "MalinkiBot/1.0 (Telegram Bot)"}
+    try:
+        async with session.get(url, params=params, headers=headers, timeout=10) as resp:
+            data = await resp.json()
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+async def get_route_info(session, start_coords, end_coords):
+    """Строит маршрут и считает время через OSRM"""
+    start_lon, start_lat = start_coords[1], start_coords[0]
+    end_lon, end_lat = end_coords[1], end_coords[0]
+    
+    url = f"http://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}?overview=false"
+    try:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status != 200: return None
+            data = await resp.json()
+            if data.get("routes"):
+                route = data["routes"][0]
+                distance_km = route["distance"] / 1000
+                duration_min = route["duration"] / 60
+                return distance_km, duration_min
+    except Exception:
+        pass
+    return None
+
+# --- Логика анализа новостей ---
 def extract_street(text):
-    """Ищет улицы, проспекты, шоссе и переулки в тексте новости"""
-    # Паттерны для разных типов адресов
     patterns = [
-        # Улица, проспект, переулок, шоссе, площадь, микрорайон (сокращения и полные)
         r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
-        
-        # "на Лежневской", "на Строителей"
         r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:ой|ий|ая|ое|ые))',
-        
-        # "в Ивановском районе", "в Ленинском"
         r'в\s+([А-ЯЁ][а-яё]+ском)\s+районе',
-        
-        # Просто названия, оканчивающиеся на "ская" (часто улицы в Иваново)
         r'\b([А-ЯЁ][а-яё]+ская)\b'
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
             street = match.group(1)
-            # Исключаем ложные срабатывания (если вдруг поймали не то)
-            if street.lower() not in ["ивановская", "областная"]: 
-                return street
+            if street.lower() not in ["ивановская", "областная"]: return street
     return None
 
 def infer_traffic_impact(text):
     lower = text.lower()
     if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет"]):
-        return "🔴 <b>Высокое</b>. Возможна серьезная пробка или полная остановка. Ищите объезд."
+        return "🔴 <b>Высокое</b>. Возможна пробка."
     elif any(w in lower for w in ["дтп", "авария", "столкновение", "пострадал", "скорая", "затор"]):
-        return "🟠 <b>Среднее</b>. Движение на участке замедлено. Возможно образование затора."
+        return "🟠 <b>Среднее</b>. Замедление движения."
     else:
-        return "🟢 <b>Низкое</b>. Существенных затруднений не ожидается."
+        return "🟢 <b>Низкое</b>. Затруднений нет."
 
 def format_time(pub_date_str=None, text=""):
     if pub_date_str:
         try:
-            dt = parsedate_to_datetime(pub_date_str)
-            dt_msk = dt.astimezone(MSK_TZ)
+            dt = parsedate_to_datetime(pub_date_str).astimezone(MSK_TZ)
             now = datetime.now(MSK_TZ)
-            if dt_msk.date() == now.date():
-                return dt_msk.strftime("%H:%M")
-            elif (now.date() - dt_msk.date()).days == 1:
-                return f"Вчера в {dt_msk.strftime('%H:%M')}"
-            else:
-                return dt_msk.strftime("%d.%m в %H:%M")
-        except Exception:
-            pass
-            
+            if dt.date() == now.date(): return dt.strftime("%H:%M")
+            elif (now.date() - dt.date()).days == 1: return f"Вчера в {dt.strftime('%H:%M')}"
+            else: return dt.strftime("%d.%m в %H:%M")
+        except Exception: pass
     match = re.search(r'\b([01]?[0-9]|2[0-3]):[0-5][0-9]\b', text)
-    if match:
-        return match.group(0)
-        
+    if match: return match.group(0)
     return "Недавно"
 
 async def fetch_news(session, url):
@@ -143,13 +161,11 @@ async def fetch_news(session, url):
                     if not title_tag: continue
                     text = title_tag.get_text(strip=True)
                     lower_text = text.lower()
-                    
                     if 25 <= len(text) <= 110 and any(kw in lower_text for kw in keywords):
                         if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
                             if not any(sw in lower_text for sw in stop_words):
                                 pub_date = item.find('pubDate')
-                                pub_date_str = pub_date.text if pub_date else None
-                                found.append({"title": text, "time": format_time(pub_date_str, text)})
+                                found.append({"title": text, "time": format_time(pub_date.text if pub_date else None, text)})
             else:
                 for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
                     text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
@@ -163,55 +179,35 @@ async def fetch_news(session, url):
         return []
 
 async def get_traffic_summary(is_bad_weather=False):
-    sources = [
-        "https://newsivanovo.ru/rss",
-        "https://ivanovonews.ru/rss/",
-        "https://mkivanovo.ru/",
-        "https://iv-news.ru/"
-    ]
-    
+    sources = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
     all_news = []
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_news(session, url) for url in sources]
         results = await asyncio.gather(*tasks)
-        for res in results:
-            all_news.extend(res)
+        for res in results: all_news.extend(res)
             
-    if not all_news:
-        return "✅ <b>Свежих сообщений о ДТП и заторах в Иваново не найдено.</b>"
+    if not all_news: return "✅ <b>Свежих сообщений о ДТП нет.</b>"
         
     unique_news = []
     for news in all_news:
         words_new = set(w.strip(".,!?\"'()-") for w in news["title"].lower().split() if len(w) > 3)
-        is_dup = False
-        for existing in unique_news:
-            words_ex = set(w.strip(".,!?\"'()-") for w in existing["title"].lower().split() if len(w) > 3)
-            if len(words_new.intersection(words_ex)) >= 2:
-                is_dup = True
-                break
-        if not is_dup:
+        if not any(len(words_new.intersection(set(w.strip(".,!?\"'()-") for w in ex["title"].lower().split() if len(w) > 3))) >= 2 for ex in unique_news):
             unique_news.append(news)
     
     text = "🚨 <b>Дорожная обстановка (Иваново):</b>\n"
-    if is_bad_weather and unique_news:
-        text += "⚠️ <i>Погода ухудшает ситуацию. Будьте внимательнее на дорогах!</i>\n"
+    if is_bad_weather and unique_news: text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
     text += "\n"
     
     for news in unique_news[:4]:
         news_text = news["title"][0].upper() + news["title"][1:]
         if news_text.endswith('.'): news_text = news_text[:-1]
-        
         street = extract_street(news_text)
         impact = infer_traffic_impact(news_text)
         time_str = news["time"]
 
         text += f"📝 <b>Событие:</b> {news_text}.\n"
         text += f"🕒 <b>Время:</b> {time_str}.\n"
-        
-        # Если улица найдена — выводим. Если нет — пропускаем строку.
-        if street:
-            text += f"📍 <b>Локация:</b> {street}.\n"
-            
+        if street: text += f"📍 <b>Локация:</b> {street}.\n"
         text += f"🚦 <b>Влияние:</b> {impact}\n"
         text += "➖➖➖➖➖➖➖➖\n"
 
@@ -220,17 +216,12 @@ async def get_traffic_summary(is_bad_weather=False):
 # --- Утренняя рассылка ---
 async def morning_broadcast():
     if not SUBSCRIBERS: return
-    
     weather_text, is_bad = await get_weather()
     traffic_text = await get_traffic_summary(is_bad_weather=is_bad)
-    
     full_text = f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather_text}\n\n{traffic_text}"
-    
     for chat_id in list(SUBSCRIBERS):
-        try:
-            await bot.send_message(chat_id, full_text, parse_mode="HTML")
-        except Exception:
-            SUBSCRIBERS.discard(chat_id)
+        try: await bot.send_message(chat_id, full_text, parse_mode="HTML")
+        except Exception: SUBSCRIBERS.discard(chat_id)
 
 # --- Хэндлеры ---
 @dp.message(Command("start"))
@@ -238,13 +229,79 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"👋 Привет! Я слежу за погодой и дорожной обстановкой в {CITY_NAME}.\n\n"
         "📋 <b>Команды:</b>\n"
-        "/weather — погода и состояние дорог 🌤\n"
+        "/weather — погода 🌤\n"
         "/traffic — пробки и ДТП 🚦\n"
         "/all — всё сразу 🗂\n"
-        "/subscribe — подписаться на утреннюю сводку (05:00 МСК) ⏰\n"
+        "/route — построить маршрут 🗺\n"
+        "/subscribe — утренняя сводка ⏰\n"
         "/unsubscribe — отписаться 🔕",
         parse_mode="HTML"
     )
+
+@dp.message(Command("route"))
+async def cmd_route(message: types.Message, state: FSMContext):
+    await state.set_state(RouteState.waiting_for_start)
+    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или улицу (например: <i>Площадь Ленина</i> или <i>ул. Лежневская 15</i>).", parse_mode="HTML")
+
+@dp.message(RouteState.waiting_for_start)
+async def process_route_start(message: types.Message, state: FSMContext):
+    await state.update_data(start_point=message.text)
+    await state.set_state(RouteState.waiting_for_end)
+    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес.")
+
+@dp.message(RouteState.waiting_for_end)
+async def process_route_end(message: types.Message, state: FSMContext):
+    end_point = message.text
+    data = await state.get_data()
+    start_point = data.get("start_point")
+    await state.clear()
+
+    wait_msg = await message.answer("⏳ Строю маршрут и проверяю обстановку...")
+
+    async with aiohttp.ClientSession() as session:
+        start_coords = await get_coords(session, start_point)
+        end_coords = await get_coords(session, end_point)
+        
+        if not start_coords or not end_coords:
+            await wait_msg.edit_text("❌ Не удалось найти один из адресов. Попробуйте указать точнее (например, добавить 'улица').")
+            return
+
+        route_data = await get_route_info(session, start_coords, end_coords)
+        
+        if not route_data:
+            await wait_msg.edit_text("❌ Не удалось проложить маршрут между этими точками.")
+            return
+
+        dist_km, base_min = route_data
+
+    # Проверяем новости на наличие ДТП
+    _, is_bad_weather = await get_weather()
+    traffic_text = await get_traffic_summary(is_bad_weather=is_bad_weather)
+    
+    # Эвристика: если в новостях есть ДТП, мы добавляем время к маршруту
+    time_penalty = 0
+    warning = ""
+    if "🚨" in traffic_text:
+        # Если нашли ДТП, делаем скидку на пробки (добавляем 5-15 минут)
+        time_penalty = 10
+        warning = "\n⚠️ <i>В городе есть ДТП (см. /traffic). Возможны задержки в пути.</i>"
+
+    total_min = int(base_min + time_penalty)
+    hours = total_min // 60
+    mins = total_min % 60
+    time_str = f"{hours} ч {mins} мин" if hours > 0 else f"{mins} мин"
+
+    result_text = (
+        f"🗺 <b>Маршрут построен:</b>\n"
+        f"📍 <b>От:</b> {start_point.capitalize()}\n"
+        f"🏁 <b>До:</b> {end_point.capitalize()}\n\n"
+        f"📏 <b>Расстояние:</b> {dist_km:.1f} км\n"
+        f"⏱ <b>Примерное время:</b> {time_str}\n"
+        f"{warning}\n\n"
+        f"🛣 <i>Расчет по разрешенной скорости (без учета текущих баллов пробок).</i>"
+    )
+    
+    await wait_msg.edit_text(result_text, parse_mode="HTML")
 
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: types.Message):

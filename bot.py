@@ -2,11 +2,14 @@ import os
 import asyncio
 import aiohttp
 import re
+import sqlite3
+import json
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from dotenv import load_dotenv
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,13 +28,120 @@ MSK_TZ = pytz.timezone("Europe/Moscow")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-SUBSCRIBERS = set()
+
+# --- База данных для настроек ---
+def init_db():
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            cities TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_user_cities(user_id: int) -> list:
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT cities FROM user_settings WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0]:
+        return json.loads(row[0])
+    return ["Иваново"] # По умолчанию только Иваново
+
+def save_user_cities(user_id: int, cities: list):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO user_settings (user_id, cities) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET cities = excluded.cities
+    """, (user_id, json.dumps(cities, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+def get_subscribers() -> list:
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM user_settings")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+init_db() # Инициализация БД при запуске
+
+# --- Список городов Ивановской области ---
+REGION_CITIES = {
+    "Иваново": (56.9972, 40.9714),
+    "Шуя": (56.8487, 41.3883),
+    "Кинешма": (57.4391, 42.1289),
+    "Вичуга": (57.2128, 41.9301),
+    "Тейково": (56.858, 40.5369),
+    "Фурманов": (57.2536, 41.1085),
+    "Кохма": (56.9349, 41.0915),
+    "Родники": (57.1051, 41.7305),
+    "Приволжск": (57.387, 41.2867),
+    "Заволжск": (57.4823, 42.1378),
+    "Наволоки": (57.4657, 41.9634),
+    "Юрьевец": (57.3201, 43.1041),
+    "Южа": (56.5831, 42.0122),
+    "Гаврилов Посад": (56.5585, 40.1217),
+    "Комсомольск": (57.0292, 40.3787),
+    "Плес": (57.4606, 41.5158),
+    "Пучеж": (56.9833, 43.1667),
+}
 
 class RouteState(StatesGroup):
     waiting_for_start = State()
     waiting_for_end = State()
 
-# --- Погода ---
+# --- Погода и утилиты ---
+def get_weather_emoji(code):
+    if code in [0, 1]: return "☀️"
+    if code in [2, 3]: return "☁️"
+    if code in [45, 48]: return "🌫"
+    if code in [51, 53, 55, 56, 57]: return "🌦"
+    if code in [61, 63, 65, 66, 67]: return "🌧"
+    if code in [71, 73, 75, 77]: return "❄️"
+    if code in [80, 81, 82]: return "🌧"
+    if code in [85, 86]: return "❄️"
+    if code in [95, 96, 99]: return "⛈"
+    return "🌡"
+
+async def get_region_weather(user_cities: list):
+    # Фильтруем только те города, которые выбрал пользователь
+    selected_cities = {city: REGION_CITIES[city] for city in user_cities if city in REGION_CITIES}
+    
+    if not selected_cities:
+        return "⚠️ Вы не выбрали ни одного города. Зайдите в /settings."
+
+    lats = ",".join(str(lat) for lat, lon in selected_cities.values())
+    lons = ",".join(str(lon) for lat, lon in selected_cities.values())
+    
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&current=temperature_2m,precipitation_probability,weather_code&timezone=Europe/Moscow"
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200: return "⚠️ Ошибка получения погоды."
+                data = await resp.json()
+                
+                lines = []
+                for i, city in enumerate(selected_cities.keys()):
+                    if i < len(data):
+                        current = data[i]["current"]
+                        temp = current.get("temperature_2m", 0)
+                        prob = current.get("precipitation_probability", 0)
+                        code = current.get("weather_code", 0)
+                        emoji = get_weather_emoji(code)
+                        lines.append(f"{emoji} <b>{city}</b>: {temp:+.0f}°C, 💧{prob}%")
+                
+                return "🌍 <b>Погода в выбранных городах:</b>\n" + "\n".join(lines)
+        except Exception:
+            return "⚠️ Ошибка при запросе к сервису."
+
 def get_road_condition(temp, desc, wind):
     desc = desc.lower()
     if "снег" in desc: return "❄️ Снегопад. Дороги скользкие.", True
@@ -44,7 +154,7 @@ def get_road_condition(temp, desc, wind):
     elif "ясно" in desc or "облачно" in desc: return "✅ Дороги сухие.", False
     return "⚪ Стандартные условия.", False
 
-async def get_weather():
+async def get_weather_ivanovo():
     url = f"https://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
@@ -64,6 +174,23 @@ async def get_weather():
                     f"💨 Ветер: {wind} м/с\n"
                     f"🛣 <b>Дорога:</b> {road}")
             return text, is_bad
+
+# --- Инлайн-клавиатура для выбора городов ---
+def get_cities_keyboard(user_cities: list):
+    keyboard = []
+    row = []
+    for city in REGION_CITIES.keys():
+        # Добавляем галочку, если город выбран
+        btn_text = f"✅ {city}" if city in user_cities else city
+        row.append(InlineKeyboardButton(text=btn_text, callback_data=f"toggle_{city}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton(text="💾 Сохранить и выйти", callback_data="save_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 # --- Маршруты (Карты) ---
 async def get_coords(session, address):
@@ -90,7 +217,7 @@ async def get_route_info(session, start_coords, end_coords):
     except Exception: pass
     return None
 
-# --- Логика анализа новостей ---
+# --- Анализ новостей ---
 def extract_street(text):
     patterns = [
         r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
@@ -128,7 +255,6 @@ def format_time(pub_date_str=None, text=""):
     return "Недавно"
 
 def clean_html(raw_html):
-    """Убирает HTML-теги из описания новости и лишние пробелы"""
     if not raw_html: return ""
     soup = BeautifulSoup(raw_html, "html.parser")
     text = soup.get_text(separator=' ')
@@ -158,18 +284,11 @@ async def fetch_news(session, url):
                         if ("иванов" in lower_text or "город" in lower_text or "област" in lower_text):
                             if not any(sw in lower_text for sw in stop_words):
                                 pub_date = item.find('pubDate')
-                                # Ищем описание
                                 desc_tag = item.find('description') or item.find('summary')
                                 raw_desc = desc_tag.get_text(strip=True) if desc_tag else ""
                                 clean_desc = clean_html(raw_desc)
-                                
-                                found.append({
-                                    "title": text, 
-                                    "time": format_time(pub_date.text if pub_date else None, text),
-                                    "desc": clean_desc
-                                })
+                                found.append({"title": text, "time": format_time(pub_date.text if pub_date else None, text), "desc": clean_desc})
             else:
-                # Если нет RSS, берем только заголовки (без описаний)
                 for tag in soup.find_all(["h1", "h2", "h3", "a", "title"]):
                     text = tag.get_text(strip=True).replace('\n', ' ').replace('\r', '')
                     lower_text = text.lower()
@@ -205,17 +324,14 @@ async def get_traffic_summary(is_bad_weather=False):
         news_text = news["title"][0].upper() + news["title"][1:]
         if news_text.endswith('.'): news_text = news_text[:-1]
         
-        street = extract_street(news_text + " " + news["desc"]) # Ищем улицу и в описании тоже
+        street = extract_street(news_text + " " + news["desc"])
         impact = infer_traffic_impact(news_text + " " + news["desc"])
         time_str = news["time"]
 
         text += f"📝 <b>Событие:</b> {news_text}.\n"
-        
-        # Если есть описание, выводим его подробности
         if news["desc"] and len(news["desc"]) > 20:
             short_desc = news["desc"][:200] + "..." if len(news["desc"]) > 200 else news["desc"]
             text += f"📄 <b>Детали:</b> <i>{short_desc}</i>\n"
-
         text += f"🕒 <b>Время:</b> {time_str}.\n"
         if street: text += f"📍 <b>Локация:</b> {street}.\n"
         text += f"🚦 <b>Влияние:</b> {impact}\n"
@@ -225,13 +341,21 @@ async def get_traffic_summary(is_bad_weather=False):
 
 # --- Утренняя рассылка ---
 async def morning_broadcast():
-    if not SUBSCRIBERS: return
-    weather_text, is_bad = await get_weather()
+    subscribers = get_subscribers()
+    if not subscribers: return
+    
+    weather_text, is_bad = await get_weather_ivanovo()
     traffic_text = await get_traffic_summary(is_bad_weather=is_bad)
-    full_text = f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather_text}\n\n{traffic_text}"
-    for chat_id in list(SUBSCRIBERS):
-        try: await bot.send_message(chat_id, full_text, parse_mode="HTML")
-        except Exception: SUBSCRIBERS.discard(chat_id)
+    
+    for user_id in subscribers:
+        user_cities = get_user_cities(user_id)
+        region_text = await get_region_weather(user_cities)
+        
+        full_text = f"🌅 <b>Доброе утро!</b>\n📅 Сводка на {datetime.now().strftime('%d.%m.%Y')}:\n\n{weather_text}\n\n{region_text}\n\n{traffic_text}"
+        try: 
+            await bot.send_message(user_id, full_text, parse_mode="HTML")
+        except Exception: 
+            pass # Если пользователь заблокировал бота
 
 # --- Хэндлеры ---
 @dp.message(Command("start"))
@@ -239,19 +363,65 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"👋 Привет! Я слежу за погодой и дорожной обстановкой в {CITY_NAME}.\n\n"
         "📋 <b>Команды:</b>\n"
-        "/weather — погода 🌤\n"
+        "/weather — погода в Иваново 🌤\n"
+        "/region — погода в выбранных городах 🌍\n"
+        "/settings — выбрать города для сводки ⚙️\n"
         "/traffic — пробки и ДТП 🚦\n"
         "/all — всё сразу 🗂\n"
         "/route — построить маршрут 🗺\n"
-        "/subscribe — утренняя сводка ⏰\n"
-        "/unsubscribe — отписаться 🔕",
+        "/subscribe — включить утреннюю сводку (05:00) ⏰\n"
+        "/unsubscribe — выключить рассылку 🔕",
         parse_mode="HTML"
     )
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: types.Message):
+    user_cities = get_user_cities(message.from_user.id)
+    await message.answer(
+        "⚙️ <b>Настройка городов</b>\n"
+        "Нажимайте на города, чтобы добавить или убрать их из сводки. "
+        "Затем нажмите «Сохранить».",
+        reply_markup=get_cities_keyboard(user_cities),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data.startswith("toggle_"))
+async def process_toggle_city(callback: CallbackQuery):
+    city = callback.data.split("_")[1]
+    user_cities = get_user_cities(callback.from_user.id)
+    
+    if city in user_cities:
+        user_cities.remove(city)
+    else:
+        user_cities.append(city)
+        
+    # Обновляем клавиатуру
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(user_cities))
+    await callback.answer(f"{city} {'добавлен' if city in user_cities else 'убран'}")
+
+@dp.callback_query(F.data == "save_settings")
+async def process_save_settings(callback: CallbackQuery):
+    # Сохраняем то, что сейчас на клавиатуре (парсим кнопки)
+    keyboard = callback.message.reply_markup.inline_keyboard
+    selected_cities = []
+    for row in keyboard:
+        for btn in row:
+            if btn.text.startswith("✅"):
+                selected_cities.append(btn.text.replace("✅ ", ""))
+                
+    save_user_cities(callback.from_user.id, selected_cities)
+    await callback.message.edit_text("✅ Настройки сохранены! Теперь сводка будет формироваться по выбранным городам.")
+    await callback.answer()
+
+@dp.message(Command("region"))
+async def cmd_region(message: types.Message):
+    user_cities = get_user_cities(message.from_user.id)
+    await message.answer(await get_region_weather(user_cities), parse_mode="HTML")
 
 @dp.message(Command("route"))
 async def cmd_route(message: types.Message, state: FSMContext):
     await state.set_state(RouteState.waiting_for_start)
-    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или улицу (например: <i>Площадь Ленина</i>).", parse_mode="HTML")
+    await message.answer("🗺 <b>Откуда выезжаете?</b>\nНапишите адрес или улицу.", parse_mode="HTML")
 
 @dp.message(RouteState.waiting_for_start)
 async def process_route_start(message: types.Message, state: FSMContext):
@@ -266,83 +436,70 @@ async def process_route_end(message: types.Message, state: FSMContext):
     start_point = data.get("start_point")
     await state.clear()
 
-    wait_msg = await message.answer("⏳ Строю маршрут и проверяю обстановку...")
-
+    wait_msg = await message.answer("⏳ Строю маршрут...")
     async with aiohttp.ClientSession() as session:
         start_coords = await get_coords(session, start_point)
         end_coords = await get_coords(session, end_point)
-        
         if not start_coords or not end_coords:
-            await wait_msg.edit_text("❌ Не удалось найти один из адресов. Попробуйте указать точнее.")
+            await wait_msg.edit_text("❌ Не удалось найти один из адресов.")
             return
-
         route_data = await get_route_info(session, start_coords, end_coords)
-        
         if not route_data:
-            await wait_msg.edit_text("❌ Не удалось проложить маршрут между этими точками.")
+            await wait_msg.edit_text("❌ Не удалось проложить маршрут.")
             return
-
         dist_km, base_min = route_data
 
-    _, is_bad_weather = await get_weather()
+    _, is_bad_weather = await get_weather_ivanovo()
     traffic_text = await get_traffic_summary(is_bad_weather=is_bad_weather)
-    
-    time_penalty = 0
-    warning = ""
-    if "🚨" in traffic_text:
-        time_penalty = 10
-        warning = "\n⚠️ <i>В городе есть ДТП (см. /traffic). Возможны задержки в пути.</i>"
+    time_penalty = 10 if "🚨" in traffic_text else 0
+    warning = "\n⚠️ <i>В городе есть ДТП (см. /traffic). Возможны задержки.</i>" if time_penalty else ""
 
     total_min = int(base_min + time_penalty)
-    hours = total_min // 60
-    mins = total_min % 60
+    hours, mins = total_min // 60, total_min % 60
     time_str = f"{hours} ч {mins} мин" if hours > 0 else f"{mins} мин"
 
-    result_text = (
-        f"🗺 <b>Маршрут построен:</b>\n"
-        f"📍 <b>От:</b> {start_point.capitalize()}\n"
-        f"🏁 <b>До:</b> {end_point.capitalize()}\n\n"
-        f"📏 <b>Расстояние:</b> {dist_km:.1f} км\n"
-        f"⏱ <b>Примерное время:</b> {time_str}\n"
-        f"{warning}\n\n"
-        f"🛣 <i>Расчет по разрешенной скорости.</i>"
-    )
-    
+    result_text = (f"🗺 <b>Маршрут построен:</b>\n📍 <b>От:</b> {start_point.capitalize()}\n"
+                   f"🏁 <b>До:</b> {end_point.capitalize()}\n\n📏 <b>Расстояние:</b> {dist_km:.1f} км\n"
+                   f"⏱ <b>Время:</b> {time_str}\n{warning}")
     await wait_msg.edit_text(result_text, parse_mode="HTML")
 
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: types.Message):
-    SUBSCRIBERS.add(message.chat.id)
+    user_cities = get_user_cities(message.from_user.id)
+    save_user_cities(message.from_user.id, user_cities) # Гарантируем наличие в БД
     await message.answer("✅ Вы подписаны на утреннюю сводку! Бот пришлет её завтра в 05:00 по Москве.")
 
 @dp.message(Command("unsubscribe"))
 async def cmd_unsubscribe(message: types.Message):
-    SUBSCRIBERS.discard(message.chat.id)
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (message.from_user.id,))
+    conn.commit()
+    conn.close()
     await message.answer("❌ Вы отписаны от утренней сводки.")
 
 @dp.message(Command("weather"))
 async def cmd_weather(message: types.Message):
-    weather_text, _ = await get_weather()
+    weather_text, _ = await get_weather_ivanovo()
     await message.answer(weather_text, parse_mode="HTML")
 
 @dp.message(Command("traffic"))
 async def cmd_traffic(message: types.Message):
-    _, is_bad = await get_weather()
-    traffic_text = await get_traffic_summary(is_bad_weather=is_bad)
-    await message.answer(traffic_text, parse_mode="HTML")
+    _, is_bad = await get_weather_ivanovo()
+    await message.answer(await get_traffic_summary(is_bad_weather=is_bad), parse_mode="HTML")
 
 @dp.message(Command("all"))
 async def cmd_all(message: types.Message):
-    weather_text, is_bad = await get_weather()
+    weather_text, is_bad = await get_weather_ivanovo()
+    user_cities = get_user_cities(message.from_user.id)
+    region_text = await get_region_weather(user_cities)
     traffic_text = await get_traffic_summary(is_bad_weather=is_bad)
-    await message.answer(f"{weather_text}\n\n{traffic_text}", parse_mode="HTML")
-
+    await message.answer(f"{weather_text}\n\n{region_text}\n\n{traffic_text}", parse_mode="HTML")
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
     scheduler.add_job(morning_broadcast, trigger='cron', hour=5, minute=0)
     scheduler.start()
-    
     print("Бот запущен. Планировщик активен.")
     await dp.start_polling(bot)
 

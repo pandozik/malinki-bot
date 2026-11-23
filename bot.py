@@ -209,42 +209,86 @@ def get_wmo_description(code):
     if code in [95, 96, 99]: return "Гроза"
     return "Облачно"
 
-def get_road_condition_wmo(code, temp):
-    if code in [71, 73, 75, 77, 85, 86]: return "❄️ Снегопад. Дороги скользкие, возможны заносы.", True
-    elif code in [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]:
-        if temp < 2: return "🌧 Гололедица. Мокрый асфальт замерзает. Высокий риск ДТП!", True
-        return "🌧 Мокрый асфальт. Тормозной путь увеличен.", True
-    elif code in [45, 48]: return "🌫 Плохая видимость. Соблюдайте дистанцию.", True
-    elif temp < -5: return "🧊 Сильный мороз. На дорогах возможна наледь.", True
-    elif temp > 25: return "☀️ Жарко. Дороги сухие.", False
-    return "✅ Дороги сухие, видимость хорошая.", False
+def get_road_condition(code, temp, humidity, precip_now, precip24, snow24, min24, visibility_m):
+    """Оценка состояния дороги по погоде за сутки (это модель, а не данные дорожных служб)."""
+    snow_codes = [71, 73, 75, 77, 85, 86]
+    rain_codes = [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]
+    fog = code in [45, 48] or (visibility_m is not None and visibility_m < 1000)
+
+    if code in snow_codes:
+        return "❄️ Идёт снег. Скользко, возможны заносы.", True
+    if code in rain_codes or precip_now > 0.1:
+        if temp <= 2:
+            return "🧊 Дождь при температуре около нуля: высокий риск гололедицы!", True
+        return "🌧 Идёт дождь. Асфальт мокрый, тормозной путь больше.", True
+    if fog:
+        return "🌫 Туман или дымка, плохая видимость. Держите дистанцию.", True
+    if precip24 >= 0.3:
+        if snow24 >= 0.5 and temp <= 2:
+            return "❄️ Недавно выпал снег: возможны снежный накат и наледь.", True
+        if temp <= 2 or min24 <= 0:
+            return "🧊 После осадков температура около нуля: возможна гололедица, особенно на мостах и в тени.", True
+        return "💧 После недавних осадков асфальт, скорее всего, мокрый. Увеличьте дистанцию.", True
+    if temp <= 1 and humidity >= 85:
+        return "🧊 Около нуля и высокая влажность: возможна гололедица и влажное покрытие.", True
+    if temp < -5:
+        return "🧊 Сильный мороз. На дорогах возможна наледь.", True
+    if visibility_m is not None and visibility_m < 5000:
+        return "☁️ Осадков нет, но видимость снижена (дымка).", False
+    return "✅ Осадков нет, дороги, вероятно, сухие.", False
+
+def _num(x, default=0.0):
+    return default if x is None else x
 
 async def get_weather_ivanovo():
     lat, lon = REGION_CITIES["Иваново"]
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,apparent_temperature,precipitation_probability,weather_code&timezone=Europe/Moscow"
+    base = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+    rich = (base + "&current=temperature_2m,apparent_temperature,precipitation_probability,weather_code,relative_humidity_2m,precipitation"
+            "&hourly=precipitation,snowfall,temperature_2m,visibility&past_hours=24&forecast_hours=1&timezone=Europe/Moscow")
+    basic = base + "&current=temperature_2m,apparent_temperature,precipitation_probability,weather_code&timezone=Europe/Moscow"
+    data = None
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status != 200: return "⚠️ Ошибка сервера погоды.", False
-                data = await resp.json()
-                current = data.get("current", {})
-                temp = current.get("temperature_2m", 0)
-                feels = current.get("apparent_temperature", 0)
-                code = current.get("weather_code", 0)
-                prob = current.get("precipitation_probability", 0)
-                
-                emoji = get_weather_emoji(code)
-                desc = get_wmo_description(code)
-                road, is_bad = get_road_condition_wmo(code, temp)
-                
-                text = (f"{emoji} <b>Погода в Иваново:</b>\n"
-                        f"🌡 Температура: <b>{temp:+.1f}°C</b> (ощущается {feels:+.1f}°C)\n"
-                        f"☁️ {desc}\n"
-                        f"💧 Вероятность осадков: {prob}%\n"
-                        f"🛣 <b>Дорога:</b> {road}")
-                return text, is_bad
-        except Exception:
-            return "⚠️ Ошибка сети при запросе погоды.", False
+        for url in (rich, basic):  # если расширенный запрос не прошёл, берём простой
+            try:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        break
+            except Exception:
+                continue
+    if not data:
+        return "⚠️ Ошибка при запросе погоды.", False
+
+    current = data.get("current", {})
+    hourly = data.get("hourly", {})
+    temp = _num(current.get("temperature_2m"))
+    feels = _num(current.get("apparent_temperature"))
+    code = current.get("weather_code", 0)
+    prob = _num(current.get("precipitation_probability"))
+    humidity = _num(current.get("relative_humidity_2m"), 0)
+    precip_now = _num(current.get("precipitation"))
+
+    precip24 = sum(_num(v) for v in hourly.get("precipitation", [])[-24:])
+    snow24 = sum(_num(v) for v in hourly.get("snowfall", [])[-24:])
+    temps = [v for v in hourly.get("temperature_2m", [])[-24:] if v is not None]
+    min24 = min(temps) if temps else temp
+    vis = [v for v in hourly.get("visibility", []) if v is not None]
+    visibility = vis[-1] if vis else None
+
+    emoji = get_weather_emoji(code)
+    desc = get_wmo_description(code)
+    road, is_bad = get_road_condition(code, temp, humidity, precip_now, precip24, snow24, min24, visibility)
+
+    text = (f"{emoji} <b>Погода в Иваново:</b>\n"
+            f"🌡 Температура: <b>{temp:+.1f}°C</b> (ощущается {feels:+.1f}°C)\n"
+            f"☁️ {desc}\n"
+            f"💧 Вероятность осадков: {prob:.0f}%\n")
+    if precip24 > 0:
+        text += f"🌧 Осадки за сутки: {precip24:.1f} мм\n"
+    if visibility is not None:
+        text += f"👁 Видимость: ~{visibility / 1000:.1f} км\n"
+    text += f"🛣 <b>Дорога:</b> {road}\n<i>Оценка по погоде за сутки, не данные дорожных служб.</i>"
+    return text, is_bad
 
 async def get_region_weather(user_cities: list):
     selected_cities = {city: REGION_CITIES[city] for city in user_cities if city in REGION_CITIES}
@@ -434,10 +478,51 @@ def clean_html(raw_html):
     if not raw_html: return ""
     return re.sub(r'\s+', ' ', BeautifulSoup(raw_html, "html.parser").get_text(separator=' ')).strip()
 
+MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+          "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12}
+DATE_RE = re.compile(r'\b(\d{1,2})\s+(' + '|'.join(MONTHS) + r')\b')
+
+def event_date_ok(text: str) -> bool:
+    """Если в тексте названа дата события (например, '20 ноября'), она не должна быть старше вчера.
+    Если дат нет, считаем новость подходящей."""
+    today = datetime.now(MSK_TZ).date()
+    dates = []
+    for d, mon in DATE_RE.findall(text.lower()):
+        try:
+            dt = datetime(today.year, MONTHS[mon], int(d)).date()
+        except ValueError:
+            continue
+        if (dt - today).days > 7:  # например, '28 декабря' в январе - это прошлый год
+            dt = dt.replace(year=today.year - 1)
+        dates.append(dt)
+    if not dates:
+        return True
+    return (today - max(dates)).days <= 1
+
+CITY_PATTERNS = {
+    "Иваново": r'иванов(?:о|е)\b',
+    "Шуя": r'\bшу(?:я|е|ю|и|ей)\b',
+    "Кинешма": r'кинешм(?:а|е|у|ы|ой)\b',
+    "Вичуга": r'вичуг(?:а|е|у|и|ой)\b',
+    "Тейково": r'тейков(?:о|е|а|у)\b',
+    "Фурманов": r'фурманов(?:е|а|у|ом)?\b',
+    "Кохма": r'кохм(?:а|е|у|ы|ой)\b',
+    "Родники": r'родник(?:и|ах|ов|ам)\b',
+    "Приволжск": r'приволжск(?:е|а|у|ом)?\b',
+    "Заволжск": r'заволжск(?:е|а|у|ом)?\b',
+    "Наволоки": r'наволок(?:и|ах|ов|ам)\b',
+    "Юрьевец": r'юрьев(?:ец|ц(?:е|а|у|ем))\b',
+    "Южа": r'\bюж(?:а|е|у|ей)\b',
+    "Гаврилов Посад": r'гаврилов[- ]посад',
+    "Комсомольск": r'комсомольск(?:е|а|у|ом)?\b',
+    "Плес": r'\bпл[её]с(?:е|а|у|ом)?\b',
+    "Пучеж": r'пучеж(?:е|а|у|ом)?\b',
+}
+
 def find_city(text):
     lower_text = text.lower()
-    for city in REGION_CITIES.keys():
-        if city.lower() in lower_text: return city
+    for city, pattern in CITY_PATTERNS.items():
+        if re.search(pattern, lower_text): return city
     return "Ивановская область"
 
 async def fetch_news(session, url):
@@ -458,6 +543,7 @@ async def fetch_news(session, url):
 
                 text = title_tag.get_text(strip=True)
                 clean_desc = clean_html(item.find('description').get_text(strip=True) if item.find('description') else "")
+                if not event_date_ok(text + " " + clean_desc): continue
                 lower_text = (text + " " + clean_desc).lower()
 
                 if re.search(pattern, lower_text):
@@ -487,6 +573,7 @@ async def fetch_telegram_channel(session, channel_name):
                 if not is_fresh(dt): continue
 
                 text = msg.get_text(separator='\n', strip=True)
+                if not event_date_ok(text): continue
                 lower_text = text.lower()
                 if re.search(pattern, lower_text) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
                     found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": format_time(dt)})
@@ -503,6 +590,7 @@ async def fetch_vk_group(session, group_url):
             for post in soup.find_all("div", class_="wall_post_text"):
                 if not vk_post_is_fresh(post): continue
                 text = post.get_text(separator='\n', strip=True)
+                if not event_date_ok(text): continue
                 if re.search(pattern, text.lower()):
                     found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": "Сегодня/вчера"})
             return found
@@ -570,7 +658,7 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
         text += f"📝 <b>Событие:</b>\n{body_text}\n\n"
         if street: text += f"📍 <b>Улица:</b> {street}.\n"
         text += f"🏙 <b>Город:</b> {news['city']}.\n"
-        text += f"🕒 <b>Когда:</b> {news['time']}\n"
+        text += f"🕒 <b>Опубликовано:</b> {news['time']}\n"
         text += f"🚦 <b>Влияние:</b> {news['impact_text']}\n"
         text += "➖➖➖➖➖➖➖➖\n\n"
     return text

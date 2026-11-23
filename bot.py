@@ -6,6 +6,7 @@ import sqlite3
 import json
 import hashlib
 import math
+import html
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -25,6 +26,12 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
+if not BOT_TOKEN:
+    raise SystemExit(
+        "BOT_TOKEN не задан. Создайте .env рядом с bot.py (BOT_TOKEN=...) "
+        "или задайте переменную окружения."
+    )
+
 CITY_NAME = "Иваново"
 MSK_TZ = pytz.timezone("Europe/Moscow")
 
@@ -39,7 +46,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_settings (
             user_id INTEGER PRIMARY KEY, 
             cities TEXT,
-            broadcast_times TEXT
+            broadcast_times TEXT,
+            news_enabled INTEGER DEFAULT 0
         )
     """)
     cursor.execute("CREATE TABLE IF NOT EXISTS fuel_history (date TEXT PRIMARY KEY, ai92 REAL, ai95 REAL, dt REAL)")
@@ -61,6 +69,10 @@ def init_db():
             end_point TEXT
         )
     """)
+    try:
+        cursor.execute("ALTER TABLE user_settings ADD COLUMN news_enabled INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -99,6 +111,24 @@ def save_user_times(user_id: int, times_list: list):
         INSERT INTO user_settings (user_id, broadcast_times) VALUES (?, ?) 
         ON CONFLICT(user_id) DO UPDATE SET broadcast_times = excluded.broadcast_times
     """, (user_id, json.dumps(times_list, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+def get_news_enabled(user_id: int) -> bool:
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT news_enabled FROM user_settings WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+def set_news_enabled(user_id: int, enabled: bool):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO user_settings (user_id, news_enabled) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET news_enabled = excluded.news_enabled
+    """, (user_id, 1 if enabled else 0))
     conn.commit()
     conn.close()
 
@@ -168,9 +198,13 @@ def cleanup_old_news():
 
 # --- Топливо ---
 def get_yesterday_fuel():
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT ai92, ai95, dt FROM fuel_history ORDER BY date DESC LIMIT 1")
+    cursor.execute(
+        "SELECT ai92, ai95, dt FROM fuel_history WHERE date < ? ORDER BY date DESC LIMIT 1",
+        (today,),
+    )
     row = cursor.fetchone()
     conn.close()
     if row: return {"АИ-92": row[0], "АИ-95": row[1], "ДТ": row[2]}
@@ -196,6 +230,14 @@ REGION_CITIES = {
     "Плес": (57.4606, 41.5158), "Пучеж": (56.9833, 43.1667),
 }
 IVANOVO_AGGLOMERATION = ["Иваново", "Кохма", "Тейково", "Фурманов", "Шуя", "Приволжск"]
+
+def news_city_matches(city: str, user_cities: list) -> bool:
+    return (
+        city == "Ивановская область"
+        or city in user_cities
+        or ("Иваново" in user_cities and city in IVANOVO_AGGLOMERATION)
+        or ("Иваново" not in user_cities and city == "Иваново")
+    )
 
 # Известные стационарные камеры
 CAMERAS = [
@@ -224,9 +266,15 @@ def get_main_menu():
         [KeyboardButton(text="🌤 Погода"), KeyboardButton(text="🌍 Города")],
         [KeyboardButton(text="🚦 ДТП и Заторы"), KeyboardButton(text="⛽ Бензин")],
         [KeyboardButton(text="🗺 Маршрут"), KeyboardButton(text="🗂 Всё сразу")],
-        [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="⏰ Время рассылки")]
+        [KeyboardButton(text="📰 Новости"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="⏰ Время рассылки")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+MENU_TEXTS = {
+    "🌤 Погода", "🌍 Города", "🚦 ДТП и Заторы", "⛽ Бензин",
+    "🗺 Маршрут", "🗂 Всё сразу", "📰 Новости", "⚙️ Настройки", "⏰ Время рассылки",
+}
 
 # --- Погода ---
 def get_weather_emoji(code):
@@ -346,7 +394,7 @@ async def get_region_weather(user_cities: list):
 def format_price_with_delta(name, current, previous):
     if not previous or current is None: return f"🔹 <b>{name}:</b> {current} ₽/л\n" if current else ""
     diff = current - previous
-    percent = (diff / previous) * 100
+    percent = (diff / previous) * 100 if previous else 0.0
     if diff > 0: return f"🔹 <b>{name}:</b> {current} ₽/л 📈 <i>(+{percent:.2f}%)</i>\n"
     elif diff < 0: return f"🔹 <b>{name}:</b> {current} ₽/л 📉 <i>({percent:.2f}%)</i>\n"
     else: return f"🔹 <b>{name}:</b> {current} ₽/л ➡️ <i>(0%)</i>\n"
@@ -432,13 +480,15 @@ async def get_fuel_situation_news():
                         if not is_fresh(parse_rss_date(date_tag.get_text(strip=True) if date_tag else None)): continue
                         text = title_tag.get_text(strip=True)
                         lower_text = text.lower()
-                        if any(re.search(rf'\b{kw}\b', lower_text) for kw in keywords) and ("иванов" in lower_text or "област" in lower_text):
-                            if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
+                        if any(re.search(rf'(?<!\w){kw}', lower_text) for kw in keywords) and ("иванов" in lower_text or "област" in lower_text):
+                            if not any(re.search(rf'(?<!\w){sw}', lower_text) for sw in stop_words):
                                 if not any(text.lower() in ex.lower() or ex.lower() in text.lower() for ex in found_news):
                                     found_news.append(text)
             except Exception: continue
     if not found_news: return None
-    return "📰 <b>Ситуация с топливом (новости):</b>\n\n" + "".join(f"🔸 {n}\n\n" for n in found_news[:3])
+    return "📰 <b>Ситуация с топливом (новости):</b>\n\n" + "".join(
+        f"🔸 {html.escape(n)}\n\n" for n in found_news[:3]
+    )
 
 # --- Маршруты ---
 def haversine(lat1, lon1, lat2, lon2):
@@ -557,7 +607,7 @@ async def fetch_news(session, url):
                 lower_text = (text + " " + clean_desc).lower()
                 if re.search(pattern, lower_text):
                     if ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
-                        if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
+                        if not any(re.search(rf'(?<!\w){sw}', lower_text) for sw in stop_words):
                             found.append({"title": text, "full_text": clean_desc, "time": format_time(dt), "city": find_city(lower_text)})
             return found
     except Exception: return []
@@ -635,7 +685,7 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
     for news in unique_news:
         impact_text, is_high = infer_traffic_impact(news["title"] + " " + news.get("full_text", ""))
         news["impact_text"] = impact_text
-        if is_high or news["city"] == "Ивановская область" or news["city"] in user_cities or ("Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION) or ("Иваново" not in user_cities and news["city"] == "Иваново"):
+        if is_high or news_city_matches(news["city"], user_cities):
             news_hash = generate_hash(news["full_text"])
             if not is_news_seen(user_id, news_hash):
                 filtered_news.append(news)
@@ -657,13 +707,129 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
     text += "\n"
     
     for news in filtered_news[:10]:
-        body_text = news.get("full_text", news["title"])
+        raw_text = news.get("full_text") or news["title"]
+        body_text = html.escape(raw_text, quote=False)
         if body_text: body_text = body_text[0].upper() + body_text[1:]
-        street = extract_street(body_text)
+        street = extract_street(raw_text)
         text += f"📝 <b>Событие:</b>\n{body_text}\n\n"
-        if street: text += f"📍 <b>Улица:</b> {street}.\n"
+        if street: text += f"📍 <b>Улица:</b> {html.escape(street)}.\n"
         text += f"🏙 <b>Город:</b> {news['city']}.\n🕒 <b>Опубликовано:</b> {news['time']}\n🚦 <b>Влияние:</b> {news['impact_text']}\n➖➖➖➖➖➖➖➖\n\n"
     return text
+
+# --- Новости ---
+NEWS_RSS_SOURCES = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
+NEWS_TG_CHANNELS = ["ivanovonewsBars", "typical_kineshma", "kineshemec_ru", "ivanovo_proisshestvia"]
+
+
+async def fetch_rss_news(session, url):
+    try:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8) as resp:
+            if resp.status != 200: return []
+            soup = BeautifulSoup(await resp.text(), "html.parser")
+            found = []
+            for item in soup.find_all("item"):
+                title_tag = item.find("title")
+                if not title_tag: continue
+                date_tag = item.find("pubdate")
+                dt = parse_rss_date(date_tag.get_text(strip=True) if date_tag else None)
+                if not is_fresh(dt): continue
+                title = title_tag.get_text(strip=True)
+                desc_tag = item.find("description")
+                desc = clean_html(desc_tag.get_text(strip=True) if desc_tag else "")
+                if not title: continue
+                if not event_date_ok(title + " " + desc): continue
+                lower_text = (title + " " + desc).lower()
+                if not ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)): continue
+                found.append({"title": title, "full_text": desc, "time": format_time(dt), "city": find_city(lower_text)})
+            return found
+    except Exception:
+        return []
+
+
+async def fetch_tg_news(session, channel_name):
+    url = f"https://t.me/s/{channel_name}"
+    try:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10) as resp:
+            if resp.status != 200: return []
+            soup = BeautifulSoup(await resp.text(), "html.parser")
+            found = []
+            for wrap in soup.find_all("div", class_="tgme_widget_message_wrap"):
+                msg_divs = wrap.find_all("div", class_="tgme_widget_message_text")
+                if not msg_divs: continue
+                time_tag = wrap.find("time")
+                dt = None
+                if time_tag and time_tag.get("datetime"):
+                    try: dt = datetime.fromisoformat(time_tag["datetime"])
+                    except ValueError: dt = None
+                if not is_fresh(dt): continue
+                clean_text = clean_telegram_text("\n".join(div.get_text(separator="\n", strip=True) for div in msg_divs))
+                if not clean_text or not event_date_ok(clean_text): continue
+                lower_text = clean_text.lower()
+                if not ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)): continue
+                found.append({
+                    "title": clean_text[:80] + ("..." if len(clean_text) > 80 else ""),
+                    "full_text": clean_text,
+                    "time": format_time(dt),
+                    "city": find_city(clean_text),
+                })
+            return found
+    except Exception:
+        return []
+
+
+def dedupe_articles(articles):
+    unique = []
+    for news in articles:
+        title_norm = news["title"].strip().lower()
+        words_new = {w.strip(".,!?\"'()-").lower() for w in (news.get("full_text") or news["title"]).split() if len(w) > 4}
+        duplicate = False
+        for ex in unique:
+            if ex["title"].strip().lower() == title_norm:
+                duplicate = True
+                break
+            words_ex = {w.strip(".,!?\"'()-").lower() for w in (ex.get("full_text") or ex["title"]).split() if len(w) > 4}
+            if len(words_new & words_ex) >= 4:
+                duplicate = True
+                break
+        if not duplicate: unique.append(news)
+    return unique
+
+
+async def collect_news():
+    articles = []
+    async with aiohttp.ClientSession() as session:
+        for res in await asyncio.gather(*[fetch_rss_news(session, url) for url in NEWS_RSS_SOURCES]):
+            articles.extend(res)
+        for res in await asyncio.gather(*[fetch_tg_news(session, ch) for ch in NEWS_TG_CHANNELS]):
+            articles.extend(res)
+    return dedupe_articles(articles)
+
+
+async def get_news_summary(user_id, user_cities, articles=None, mark_seen=False):
+    cleanup_old_news()
+    if articles is None:
+        articles = await collect_news()
+    filtered = []
+    for news in articles:
+        if not news_city_matches(news["city"], user_cities): continue
+        news_hash = generate_hash(news.get("full_text") or news["title"])
+        if mark_seen and is_news_seen(user_id, news_hash): continue
+        filtered.append(news)
+        if mark_seen: mark_news_as_seen(user_id, news_hash)
+    if not filtered:
+        return "✅ <b>Свежих новостей по выбранным городам нет.</b>"
+    text = "📰 <b>Новости Ивановской области:</b>\n\n"
+    for news in filtered[:6]:
+        title = html.escape(news["title"])
+        desc = html.escape((news.get("full_text") or "")[:300], quote=False)
+        block = f"🔸 <b>{title}</b>\n"
+        if desc and desc.lower() != news["title"].lower():
+            block += f"{desc}\n"
+        block += f"🏙 {news['city']} · 🕒 {news['time']}\n➖➖➖➖➖➖➖➖\n"
+        if len(text) + len(block) > 3900: break
+        text += block
+    return text
+
 
 # --- Универсальная функция расчета маршрута ---
 async def calculate_and_send_route(user_id, start_point, end_point, send_func):
@@ -716,10 +882,22 @@ async def calculate_and_send_route(user_id, start_point, end_point, send_func):
     
     # Кнопка сохранения
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data=f"save_route_{start_point[:10]}_{end_point[:10]}")]
+        [InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data="save_route")]
     ])
     
     await wait_msg.edit_text(result_text, parse_mode="HTML", reply_markup=keyboard)
+
+def split_message(text: str, limit: int = 3900) -> list:
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n\n", 0, limit)
+        if cut < 1000: cut = text.rfind("\n", 0, limit)
+        if cut < 1000: cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text: parts.append(text)
+    return parts
+
 
 # --- Рассылка ---
 async def broadcast_job():
@@ -730,6 +908,7 @@ async def broadcast_job():
     weather_text, is_bad = await get_weather_ivanovo()
     fuel_text = await get_fuel_prices(show_delta=True)
     fuel_news = await get_fuel_situation_news()
+    news_articles = await collect_news() if any(get_news_enabled(uid) for uid in users) else []
     
     for user_id in users:
         user_cities = get_user_cities(user_id)
@@ -737,11 +916,16 @@ async def broadcast_job():
                      f"{weather_text}\n\n{await get_region_weather(user_cities)}\n\n{fuel_text}\n\n")
         if fuel_news: full_text += f"{fuel_news}\n"
         full_text += f"{await get_traffic_summary(user_id, is_bad, user_cities)}"
-        try: await bot.send_message(user_id, full_text, parse_mode="HTML")
-        except Exception: pass
+        if news_articles:
+            news_text = await get_news_summary(user_id, user_cities, articles=news_articles, mark_seen=True)
+            if not news_text.startswith("✅"):
+                full_text += "\n\n" + news_text
+        for part in split_message(full_text):
+            try: await bot.send_message(user_id, part, parse_mode="HTML")
+            except Exception: pass
 
 # --- Клавиатуры ---
-def get_cities_keyboard(user_cities: list):
+def get_cities_keyboard(user_id: int, user_cities: list):
     keyboard = []
     keyboard.append([InlineKeyboardButton(text="✅ Выбрать ВСЕ", callback_data="select_all"), InlineKeyboardButton(text="❌ Очистить", callback_data="clear_all")])
     row = []
@@ -751,6 +935,11 @@ def get_cities_keyboard(user_cities: list):
         if len(row) == 2:
             keyboard.append(row); row = []
     if row: keyboard.append(row)
+    news_on = get_news_enabled(user_id)
+    keyboard.append([InlineKeyboardButton(
+        text="📰 Новости: ✅ вкл" if news_on else "📰 Новости: ❌ выкл",
+        callback_data="toggle_news",
+    )])
     keyboard.append([InlineKeyboardButton(text="💾 Сохранить и выйти", callback_data="save_settings")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -768,15 +957,16 @@ def get_routes_keyboard(user_id):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     intro_text = (
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        f"👋 <b>Привет, {html.escape(message.from_user.first_name or 'друг')}!</b>\n\n"
         "Я — твой персональный помощник по <b>Ивановской области</b>.\n\n"
         "📌 <b>Что я умею:</b>\n"
         "🌤 <b>Погода</b> — прогноз и состояние дорог.\n"
         "🌍 <b>Города</b> — погода в выбранных городах.\n"
         "🚦 <b>ДТП и Заторы</b> — оперативные новости, балл пробок и улицы.\n"
         "⛽ <b>Бензин</b> — цены и новости.\n"
+        "📰 <b>Новости</b> — новости Ивановской области и ваших городов (включается в настройках).\n"
         "🗺 <b>Маршрут</b> — расчет времени в пути, <b>сохранение маршрутов и предупреждение о камерах!</b>\n\n"
-        "⚙️ <b>Настройки:</b> Выбери города и настрой до 3-х времен для рассылки.\n\n"
+        "⚙️ <b>Настройки:</b> Выбери города, включи новости и настрой до 3-х времен для рассылки.\n\n"
         "👇 <i>Используй кнопки меню внизу экрана.</i>"
     )
     await message.answer(intro_text, reply_markup=get_main_menu(), parse_mode="HTML")
@@ -797,6 +987,16 @@ async def cmd_fuel(message: types.Message):
     if news: text += f"\n\n{news}"
     await message.answer(text, parse_mode="HTML")
 
+@dp.message(F.text == "📰 Новости")
+@dp.message(Command("news"))
+async def cmd_news(message: types.Message):
+    user_id = message.from_user.id
+    if not get_news_enabled(user_id):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Включить новости", callback_data="news_on")]])
+        await message.answer("📰 Новости выключены. Включить их?", reply_markup=keyboard)
+        return
+    await message.answer(await get_news_summary(user_id, get_user_cities(user_id)), parse_mode="HTML")
+
 @dp.message(F.text == "🚦 ДТП и Заторы")
 @dp.message(Command("traffic"))
 async def cmd_traffic(message: types.Message):
@@ -812,12 +1012,15 @@ async def cmd_all(message: types.Message):
     text = (f"{weather_text}\n\n{await get_region_weather(get_user_cities(user_id))}\n\n{await get_fuel_prices(True)}\n\n")
     if fuel_news: text += f"{fuel_news}\n"
     text += f"{await get_traffic_summary(user_id, is_bad, get_user_cities(user_id))}"
-    await message.answer(text, parse_mode="HTML")
+    if get_news_enabled(user_id):
+        text += "\n\n" + await get_news_summary(user_id, get_user_cities(user_id))
+    for part in split_message(text):
+        await message.answer(part, parse_mode="HTML")
 
 @dp.message(F.text == "⚙️ Настройки")
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message): 
-    await message.answer("⚙️ <b>Настройка городов</b>\nВыберите города:", reply_markup=get_cities_keyboard(get_user_cities(message.from_user.id)), parse_mode="HTML")
+    await message.answer("⚙️ <b>Настройки</b>\nВыберите города и при необходимости включите новости:", reply_markup=get_cities_keyboard(message.from_user.id, get_user_cities(message.from_user.id)), parse_mode="HTML")
 
 @dp.message(F.text == "⏰ Время рассылки")
 async def menu_broadcast_time(message: types.Message, state: FSMContext):
@@ -829,8 +1032,10 @@ async def menu_broadcast_time(message: types.Message, state: FSMContext):
     await state.set_state(BroadcastState.waiting_for_time)
     await message.answer(text, parse_mode="HTML")
 
-@dp.message(BroadcastState.waiting_for_time)
+@dp.message(BroadcastState.waiting_for_time, ~F.text.in_(MENU_TEXTS))
 async def process_broadcast_time(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Нужно время текстом, например 07:30.")
     text = message.text.strip().lower()
     user_id = message.from_user.id
     if text in ["0", "отмена", "стоп"]:
@@ -867,23 +1072,31 @@ async def start_new_route(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(RouteState.waiting_for_start)
 async def process_route_start(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Нужен текстовый адрес, например: Иваново, ул. Ленина 10.")
     await state.update_data(start_point=message.text)
     await state.set_state(RouteState.waiting_for_end)
-    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес или город.")
+    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес или город.", parse_mode="HTML")
 
 @dp.message(RouteState.waiting_for_end)
 async def process_route_end(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Нужен текстовый адрес.")
     end_point, data = message.text, await state.get_data()
     start_point = data.get("start_point")
     await state.update_data(end_point=end_point)
     await calculate_and_send_route(message.from_user.id, start_point, end_point, message.answer)
+    await state.set_state(None)
 
 @dp.callback_query(F.data.startswith("run_route_"))
 async def run_saved_route(callback: CallbackQuery):
     route_id = int(callback.data.split("_")[2])
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT start_point, end_point FROM saved_routes WHERE id = ?", (route_id,))
+    cursor.execute(
+        "SELECT start_point, end_point FROM saved_routes WHERE id = ? AND user_id = ?",
+        (route_id, callback.from_user.id),
+    )
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -891,17 +1104,23 @@ async def run_saved_route(callback: CallbackQuery):
     else:
         await callback.answer("Маршрут не найден", show_alert=True)
 
-@dp.callback_query(F.data.startswith("save_route_"))
+@dp.callback_query(F.data == "save_route")
 async def ask_route_name(callback: CallbackQuery, state: FSMContext):
-    data = callback.data.split("_")
-    # Восстанавливаем start и end (они могут быть обрезаны, поэтому берем из FSM или callback)
-    # Лучше брать из FSM, но для простоты передадим в callback (немного костыльно, но работает)
-    await callback.message.edit_text("💾 <b>Как назовем этот маршрут?</b>\nНапример: «Работа», «Домой», «Дача».")
+    data = await state.get_data()
+    if not data.get("start_point") or not data.get("end_point"):
+        await callback.answer("Маршрут уже неактуален — постройте заново.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "💾 <b>Как назовем этот маршрут?</b>\nНапример: «Работа», «Домой», «Дача».",
+        parse_mode="HTML",
+    )
     await state.set_state(RouteState.waiting_for_route_name)
     await callback.answer()
 
 @dp.message(RouteState.waiting_for_route_name)
 async def save_route_name(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Название нужно текстом.")
     name = message.text.strip()
     data = await state.get_data()
     start = data.get("start_point")
@@ -918,13 +1137,13 @@ async def save_route_name(message: types.Message, state: FSMContext):
 async def process_select_all(callback: CallbackQuery):
     all_cities = list(REGION_CITIES.keys())
     save_user_cities(callback.from_user.id, all_cities)
-    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(all_cities))
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(callback.from_user.id, all_cities))
     await callback.answer("Выбраны все города")
 
 @dp.callback_query(F.data == "clear_all")
 async def process_clear_all(callback: CallbackQuery):
     save_user_cities(callback.from_user.id, [])
-    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard([]))
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(callback.from_user.id, []))
     await callback.answer("Список городов очищен")
 
 @dp.callback_query(F.data.startswith("toggle_"))
@@ -934,7 +1153,7 @@ async def process_toggle_city(callback: CallbackQuery):
     if city in user_cities: user_cities.remove(city)
     else: user_cities.append(city)
     save_user_cities(callback.from_user.id, user_cities)
-    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(user_cities))
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(callback.from_user.id, user_cities))
     await callback.answer()
 
 @dp.callback_query(F.data == "save_settings")
@@ -942,11 +1161,34 @@ async def process_save_settings(callback: CallbackQuery):
     await callback.message.edit_text("✅ Настройки городов сохранены!")
     await callback.answer()
 
+@dp.callback_query(F.data == "news_on")
+async def process_news_on(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    set_news_enabled(user_id, True)
+    await callback.answer("Новости включены")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(await get_news_summary(user_id, get_user_cities(user_id)), parse_mode="HTML")
+
+@dp.callback_query(F.data == "toggle_news")
+async def process_toggle_news(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    enabled = not get_news_enabled(user_id)
+    set_news_enabled(user_id, enabled)
+    await callback.answer("Новости включены" if enabled else "Новости выключены")
+    await callback.message.edit_reply_markup(reply_markup=get_cities_keyboard(user_id, get_user_cities(user_id)))
+
 # --- Запуск ---
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
     scheduler.add_job(broadcast_job, trigger='cron', minute='*')
     scheduler.start()
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
     print("Бот запущен.")
     await dp.start_polling(bot)
 

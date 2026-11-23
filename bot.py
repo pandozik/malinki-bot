@@ -22,7 +22,7 @@ from email.utils import parsedate_to_datetime
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY") 
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 CITY_NAME = "Иваново"
 MSK_TZ = pytz.timezone("Europe/Moscow")
@@ -316,6 +316,39 @@ async def get_fuel_prices(show_delta=False):
     except Exception:
         return "⚠️ Ошибка сети при запросе цен."
 
+# --- Свежесть новостей: только сегодня и вчера (по МСК) ---
+def parse_rss_date(s):
+    """Строка pubDate из RSS -> datetime с часовым поясом, либо None."""
+    if not s:
+        return None
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.utc)
+        return dt
+    except Exception:
+        return None
+
+def is_fresh(dt) -> bool:
+    """True, если дата - сегодня или вчера по Москве. Нет даты - False."""
+    if dt is None:
+        return False
+    today = datetime.now(MSK_TZ).date()
+    return (today - dt.astimezone(MSK_TZ).date()).days in (0, 1)
+
+def vk_post_is_fresh(text_div) -> bool:
+    """Ищет дату поста ВК рядом с текстом: 'сегодня', 'вчера', 'N часов назад'."""
+    node = text_div
+    for _ in range(6):
+        node = node.parent
+        if node is None:
+            return False
+        d = node.find(class_="rel_date") or node.find(class_="wi_date")
+        if d:
+            t = d.get_text(" ", strip=True).lower()
+            return any(w in t for w in ("сегодня", "вчера", "назад", "только что"))
+    return False
+
 async def get_fuel_situation_news():
     sources = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
     keywords = ["дефицит", "бензин", "топливо", "азс", "заправк", "очеред", "лимит", "ограничен"]
@@ -331,6 +364,8 @@ async def get_fuel_situation_news():
                     for item in soup.find_all('item'):
                         title_tag = item.find('title')
                         if not title_tag: continue
+                        date_tag = item.find('pubdate')
+                        if not is_fresh(parse_rss_date(date_tag.get_text(strip=True) if date_tag else None)): continue
                         text = title_tag.get_text(strip=True)
                         lower_text = text.lower()
                         
@@ -387,15 +422,12 @@ def infer_traffic_impact(text):
     elif any(w in lower for w in ["дтп", "авария", "столкновение", "пострадал", "скорая", "затор", "пробка", "скопление"]): return "🟠 <b>Среднее</b>. Замедление.", False
     return "🟢 <b>Низкое</b>. Затруднений нет.", False
 
-def format_time(pub_date_str=None, text=""):
-    if pub_date_str:
-        try:
-            dt = parsedate_to_datetime(pub_date_str).astimezone(MSK_TZ)
-            if dt.date() == datetime.now(MSK_TZ).date(): return dt.strftime("%H:%M")
-            return f"Вчера в {dt.strftime('%H:%M')}"
-        except Exception: pass
-    match = re.search(r'\b([01]?[0-9]|2[0-3]):[0-5][0-9]\b', text)
-    if match: return match.group(0)
+def format_time(dt=None, text=""):
+    if dt:
+        dt = dt.astimezone(MSK_TZ)
+        if dt.date() == datetime.now(MSK_TZ).date():
+            return f"Сегодня в {dt.strftime('%H:%M')}"
+        return f"Вчера в {dt.strftime('%H:%M')}"
     return "Недавно"
 
 def clean_html(raw_html):
@@ -418,15 +450,20 @@ async def fetch_news(session, url):
             for item in soup.find_all('item'):
                 title_tag = item.find('title')
                 if not title_tag: continue
+
+                # html.parser переводит имена тегов в нижний регистр: ищем 'pubdate', а не 'pubDate'
+                date_tag = item.find('pubdate')
+                dt = parse_rss_date(date_tag.get_text(strip=True) if date_tag else None)
+                if not is_fresh(dt): continue
+
                 text = title_tag.get_text(strip=True)
-                # Сохраняем ПОЛНЫЙ текст новости, а не обрезаем
                 clean_desc = clean_html(item.find('description').get_text(strip=True) if item.find('description') else "")
                 lower_text = (text + " " + clean_desc).lower()
-                
+
                 if re.search(pattern, lower_text):
                     if ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
                         if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
-                            found.append({"title": text, "full_text": clean_desc, "time": format_time(item.find('pubDate').text if item.find('pubDate') else None, text), "city": find_city(lower_text)})
+                            found.append({"title": text, "full_text": clean_desc, "time": format_time(dt), "city": find_city(lower_text)})
             return found
     except Exception: return []
 
@@ -438,13 +475,21 @@ async def fetch_telegram_channel(session, channel_name):
             soup = BeautifulSoup(await resp.text(), "html.parser")
             pattern = r'\b(затор|пробка|пробки|скопление|затруднено|перекрыт|стоит|дтп|авария)\b'
             found = []
-            for msg in soup.find_all("div", class_="tgme_widget_message_text"):
-                # Сохраняем переносы строк (важно для красоты)
+            for wrap in soup.find_all("div", class_="tgme_widget_message_wrap"):
+                msg = wrap.find("div", class_="tgme_widget_message_text")
+                if not msg: continue
+
+                time_tag = wrap.find("time")
+                dt = None
+                if time_tag and time_tag.get("datetime"):
+                    try: dt = datetime.fromisoformat(time_tag["datetime"])
+                    except ValueError: dt = None
+                if not is_fresh(dt): continue
+
                 text = msg.get_text(separator='\n', strip=True)
                 lower_text = text.lower()
                 if re.search(pattern, lower_text) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
-                    # Для ТГ мы берем весь текст как "full_text"
-                    found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": "Недавно"})
+                    found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": format_time(dt)})
             return found
     except Exception: return []
 
@@ -456,14 +501,14 @@ async def fetch_vk_group(session, group_url):
             pattern = r'\b(затор|пробка|пробки|скопление|затруднено|перекрыт|дтп|авария)\b'
             found = []
             for post in soup.find_all("div", class_="wall_post_text"):
+                if not vk_post_is_fresh(post): continue
                 text = post.get_text(separator='\n', strip=True)
-                lower_text = text.lower()
-                if re.search(pattern, lower_text):
-                    found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": "Недавно"})
+                if re.search(pattern, text.lower()):
+                    found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": "Сегодня/вчера"})
             return found
     except Exception: return []
 
-async def get_traffic_summary(user_id, is_bad_weather, user_cities):
+async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=True):
     # Очищаем старые записи раз в сутки (при вызове)
     cleanup_old_news()
     
@@ -482,7 +527,7 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities):
         vk_tasks = [fetch_vk_group(session, url) for url in vk_urls]
         for res in await asyncio.gather(*vk_tasks): all_news.extend(res)
 
-    if not all_news: return "✅ <b>Свежих сообщений о ДТП нет.</b>"
+    if not all_news: return "✅ <b>Свежих сообщений о ДТП нет (за сегодня и вчера).</b>"
         
     unique_news = []
     for news in all_news:
@@ -499,11 +544,12 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities):
         # Географический фильтр
         if is_high or news["city"] == "Ивановская область" or news["city"] in user_cities or ("Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION) or ("Иваново" not in user_cities and news["city"] == "Иваново"):
             
-            # ГЛАВНАЯ ФИШКА: Проверяем, видел ли пользователь это
-            news_hash = generate_hash(news["full_text"]) # Хэш по полному тексту
+            # Проверяем, видел ли пользователь это
+            news_hash = generate_hash(news["full_text"])  # Хэш по полному тексту
             if not is_news_seen(user_id, news_hash):
                 filtered_news.append(news)
-                mark_news_as_seen(user_id, news_hash) # Запоминаем, что показали
+                if mark_seen:
+                    mark_news_as_seen(user_id, news_hash)  # Запоминаем, что показали
             
     if not filtered_news: return "✅ <b>Свежих сообщений о заторах в выбранных городах нет (все уже прочитаны).</b>"
     
@@ -524,6 +570,7 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities):
         text += f"📝 <b>Событие:</b>\n{body_text}\n\n"
         if street: text += f"📍 <b>Улица:</b> {street}.\n"
         text += f"🏙 <b>Город:</b> {news['city']}.\n"
+        text += f"🕒 <b>Когда:</b> {news['time']}\n"
         text += f"🚦 <b>Влияние:</b> {news['impact_text']}\n"
         text += "➖➖➖➖➖➖➖➖\n\n"
     return text
@@ -583,9 +630,10 @@ async def cmd_start(message: types.Message):
         "📌 <b>Что я умею:</b>\n"
         "🌤 <b>Погода</b> — прогноз и состояние дорог.\n"
         "🌍 <b>Города</b> — погода в выбранных городах.\n"
-        "🚦 <b>ДТП и Заторы</b> — оперативные новости. <b>(Новое: присылаю полный текст и не повторяю прочитанное!)</b>\n"
+        "🚦 <b>ДТП и Заторы</b> — оперативные новости за сегодня и вчера, без повторов.\n"
         "⛽ <b>Бензин</b> — цены и новости.\n"
-        "🗺 <b>Маршрут</b> — расчет времени в пути.\n\n"
+        "🗺 <b>Маршрут</b> — расчет времени в пути.\n"
+        "\n"
         "⚙️ <b>Настройки:</b> Выбери города и настрой до 3-х времен для рассылки.\n\n"
         "👇 <i>Используй кнопки меню внизу экрана.</i>"
     )
@@ -609,7 +657,10 @@ async def cmd_fuel(message: types.Message):
 
 @dp.message(F.text == "🚦 ДТП и Заторы")
 @dp.message(Command("traffic"))
-async def cmd_traffic(message: types.Message): await message.answer(await get_traffic_summary(message.from_user.id, (await get_weather_ivanovo())[1], get_user_cities(message.from_user.id)), parse_mode="HTML")
+async def cmd_traffic(message: types.Message):
+    uid = message.from_user.id
+    text = await get_traffic_summary(uid, (await get_weather_ivanovo())[1], get_user_cities(uid))
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "🗂 Всё сразу")
 @dp.message(Command("all"))
@@ -701,11 +752,14 @@ async def process_route_end(message: types.Message, state: FSMContext):
         if not route_data: return await wait_msg.edit_text("❌ Ошибка маршрута.")
         dist_km, base_min = route_data
     _, is_bad = await get_weather_ivanovo()
-    time_penalty = 10 if "🚨" in await get_traffic_summary(message.from_user.id, is_bad, get_user_cities(message.from_user.id)) else 0
+    # mark_seen=False: маршрут не должен помечать новости «прочитанными»
+    traffic_text = await get_traffic_summary(message.from_user.id, is_bad, get_user_cities(message.from_user.id), mark_seen=False)
+    time_penalty = 10 if "🚨" in traffic_text else 0
     total_min = int(base_min + time_penalty)
     time_str = f"{total_min // 60} ч {total_min % 60} мин"
     await wait_msg.edit_text(f"🗺 <b>Маршрут:</b>\n{start_point.capitalize()} ➡️ {end_point.capitalize()}\n📏 {dist_km:.1f} км\n⏱ {time_str}", parse_mode="HTML")
 
+# --- Настройки городов ---
 @dp.callback_query(F.data == "select_all")
 async def process_select_all(callback: CallbackQuery):
     all_cities = list(REGION_CITIES.keys())

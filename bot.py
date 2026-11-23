@@ -6,6 +6,7 @@ import sqlite3
 import json
 import hashlib
 import math
+import html
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -24,6 +25,12 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+
+if not BOT_TOKEN:
+    raise SystemExit(
+        "BOT_TOKEN не задан. Создайте .env рядом с bot.py (BOT_TOKEN=...) "
+        "или задайте переменную окружения."
+    )
 
 CITY_NAME = "Иваново"
 MSK_TZ = pytz.timezone("Europe/Moscow")
@@ -168,9 +175,13 @@ def cleanup_old_news():
 
 # --- Топливо ---
 def get_yesterday_fuel():
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT ai92, ai95, dt FROM fuel_history ORDER BY date DESC LIMIT 1")
+    cursor.execute(
+        "SELECT ai92, ai95, dt FROM fuel_history WHERE date < ? ORDER BY date DESC LIMIT 1",
+        (today,),
+    )
     row = cursor.fetchone()
     conn.close()
     if row: return {"АИ-92": row[0], "АИ-95": row[1], "ДТ": row[2]}
@@ -227,6 +238,11 @@ def get_main_menu():
         [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="⏰ Время рассылки")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+MENU_TEXTS = {
+    "🌤 Погода", "🌍 Города", "🚦 ДТП и Заторы", "⛽ Бензин",
+    "🗺 Маршрут", "🗂 Всё сразу", "⚙️ Настройки", "⏰ Время рассылки",
+}
 
 # --- Погода ---
 def get_weather_emoji(code):
@@ -346,7 +362,7 @@ async def get_region_weather(user_cities: list):
 def format_price_with_delta(name, current, previous):
     if not previous or current is None: return f"🔹 <b>{name}:</b> {current} ₽/л\n" if current else ""
     diff = current - previous
-    percent = (diff / previous) * 100
+    percent = (diff / previous) * 100 if previous else 0.0
     if diff > 0: return f"🔹 <b>{name}:</b> {current} ₽/л 📈 <i>(+{percent:.2f}%)</i>\n"
     elif diff < 0: return f"🔹 <b>{name}:</b> {current} ₽/л 📉 <i>({percent:.2f}%)</i>\n"
     else: return f"🔹 <b>{name}:</b> {current} ₽/л ➡️ <i>(0%)</i>\n"
@@ -432,13 +448,15 @@ async def get_fuel_situation_news():
                         if not is_fresh(parse_rss_date(date_tag.get_text(strip=True) if date_tag else None)): continue
                         text = title_tag.get_text(strip=True)
                         lower_text = text.lower()
-                        if any(re.search(rf'\b{kw}\b', lower_text) for kw in keywords) and ("иванов" in lower_text or "област" in lower_text):
-                            if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
+                        if any(re.search(rf'(?<!\w){kw}', lower_text) for kw in keywords) and ("иванов" in lower_text or "област" in lower_text):
+                            if not any(re.search(rf'(?<!\w){sw}', lower_text) for sw in stop_words):
                                 if not any(text.lower() in ex.lower() or ex.lower() in text.lower() for ex in found_news):
                                     found_news.append(text)
             except Exception: continue
     if not found_news: return None
-    return "📰 <b>Ситуация с топливом (новости):</b>\n\n" + "".join(f"🔸 {n}\n\n" for n in found_news[:3])
+    return "📰 <b>Ситуация с топливом (новости):</b>\n\n" + "".join(
+        f"🔸 {html.escape(n)}\n\n" for n in found_news[:3]
+    )
 
 # --- Маршруты ---
 def haversine(lat1, lon1, lat2, lon2):
@@ -557,7 +575,7 @@ async def fetch_news(session, url):
                 lower_text = (text + " " + clean_desc).lower()
                 if re.search(pattern, lower_text):
                     if ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
-                        if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
+                        if not any(re.search(rf'(?<!\w){sw}', lower_text) for sw in stop_words):
                             found.append({"title": text, "full_text": clean_desc, "time": format_time(dt), "city": find_city(lower_text)})
             return found
     except Exception: return []
@@ -657,11 +675,12 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
     text += "\n"
     
     for news in filtered_news[:10]:
-        body_text = news.get("full_text", news["title"])
+        raw_text = news.get("full_text") or news["title"]
+        body_text = html.escape(raw_text, quote=False)
         if body_text: body_text = body_text[0].upper() + body_text[1:]
-        street = extract_street(body_text)
+        street = extract_street(raw_text)
         text += f"📝 <b>Событие:</b>\n{body_text}\n\n"
-        if street: text += f"📍 <b>Улица:</b> {street}.\n"
+        if street: text += f"📍 <b>Улица:</b> {html.escape(street)}.\n"
         text += f"🏙 <b>Город:</b> {news['city']}.\n🕒 <b>Опубликовано:</b> {news['time']}\n🚦 <b>Влияние:</b> {news['impact_text']}\n➖➖➖➖➖➖➖➖\n\n"
     return text
 
@@ -716,7 +735,7 @@ async def calculate_and_send_route(user_id, start_point, end_point, send_func):
     
     # Кнопка сохранения
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data=f"save_route_{start_point[:10]}_{end_point[:10]}")]
+        [InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data="save_route")]
     ])
     
     await wait_msg.edit_text(result_text, parse_mode="HTML", reply_markup=keyboard)
@@ -768,7 +787,7 @@ def get_routes_keyboard(user_id):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     intro_text = (
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        f"👋 <b>Привет, {html.escape(message.from_user.first_name or 'друг')}!</b>\n\n"
         "Я — твой персональный помощник по <b>Ивановской области</b>.\n\n"
         "📌 <b>Что я умею:</b>\n"
         "🌤 <b>Погода</b> — прогноз и состояние дорог.\n"
@@ -829,8 +848,10 @@ async def menu_broadcast_time(message: types.Message, state: FSMContext):
     await state.set_state(BroadcastState.waiting_for_time)
     await message.answer(text, parse_mode="HTML")
 
-@dp.message(BroadcastState.waiting_for_time)
+@dp.message(BroadcastState.waiting_for_time, ~F.text.in_(MENU_TEXTS))
 async def process_broadcast_time(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Нужно время текстом, например 07:30.")
     text = message.text.strip().lower()
     user_id = message.from_user.id
     if text in ["0", "отмена", "стоп"]:
@@ -867,23 +888,31 @@ async def start_new_route(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(RouteState.waiting_for_start)
 async def process_route_start(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Нужен текстовый адрес, например: Иваново, ул. Ленина 10.")
     await state.update_data(start_point=message.text)
     await state.set_state(RouteState.waiting_for_end)
-    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес или город.")
+    await message.answer("🏁 <b>Куда едем?</b>\nНапишите конечный адрес или город.", parse_mode="HTML")
 
 @dp.message(RouteState.waiting_for_end)
 async def process_route_end(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Нужен текстовый адрес.")
     end_point, data = message.text, await state.get_data()
     start_point = data.get("start_point")
     await state.update_data(end_point=end_point)
     await calculate_and_send_route(message.from_user.id, start_point, end_point, message.answer)
+    await state.set_state(None)
 
 @dp.callback_query(F.data.startswith("run_route_"))
 async def run_saved_route(callback: CallbackQuery):
     route_id = int(callback.data.split("_")[2])
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT start_point, end_point FROM saved_routes WHERE id = ?", (route_id,))
+    cursor.execute(
+        "SELECT start_point, end_point FROM saved_routes WHERE id = ? AND user_id = ?",
+        (route_id, callback.from_user.id),
+    )
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -891,17 +920,23 @@ async def run_saved_route(callback: CallbackQuery):
     else:
         await callback.answer("Маршрут не найден", show_alert=True)
 
-@dp.callback_query(F.data.startswith("save_route_"))
+@dp.callback_query(F.data == "save_route")
 async def ask_route_name(callback: CallbackQuery, state: FSMContext):
-    data = callback.data.split("_")
-    # Восстанавливаем start и end (они могут быть обрезаны, поэтому берем из FSM или callback)
-    # Лучше брать из FSM, но для простоты передадим в callback (немного костыльно, но работает)
-    await callback.message.edit_text("💾 <b>Как назовем этот маршрут?</b>\nНапример: «Работа», «Домой», «Дача».")
+    data = await state.get_data()
+    if not data.get("start_point") or not data.get("end_point"):
+        await callback.answer("Маршрут уже неактуален — постройте заново.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "💾 <b>Как назовем этот маршрут?</b>\nНапример: «Работа», «Домой», «Дача».",
+        parse_mode="HTML",
+    )
     await state.set_state(RouteState.waiting_for_route_name)
     await callback.answer()
 
 @dp.message(RouteState.waiting_for_route_name)
 async def save_route_name(message: types.Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("Название нужно текстом.")
     name = message.text.strip()
     data = await state.get_data()
     start = data.get("start_point")
@@ -947,6 +982,10 @@ async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
     scheduler.add_job(broadcast_job, trigger='cron', minute='*')
     scheduler.start()
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
     print("Бот запущен.")
     await dp.start_polling(bot)
 

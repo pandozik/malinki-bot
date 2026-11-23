@@ -42,7 +42,6 @@ def init_db():
         )
     """)
     cursor.execute("CREATE TABLE IF NOT EXISTS fuel_history (date TEXT PRIMARY KEY, ai92 REAL, ai95 REAL, dt REAL)")
-    # Таблица для запоминания прочитанных новостей
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS seen_news (
             user_id INTEGER, 
@@ -127,7 +126,6 @@ def mark_news_as_seen(user_id, news_hash):
     conn.close()
 
 def cleanup_old_news():
-    """Удаляет старые записи (старше 3 дней), чтобы база не пухла"""
     cutoff = (datetime.now(MSK_TZ) - timedelta(days=3)).strftime("%Y-%m-%d")
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
@@ -210,7 +208,6 @@ def get_wmo_description(code):
     return "Облачно"
 
 def get_road_condition(code, temp, humidity, precip_now, precip24, snow24, min24, visibility_m):
-    """Оценка состояния дороги по погоде за сутки (это модель, а не данные дорожных служб)."""
     snow_codes = [71, 73, 75, 77, 85, 86]
     rain_codes = [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]
     fog = code in [45, 48] or (visibility_m is not None and visibility_m < 1000)
@@ -248,7 +245,7 @@ async def get_weather_ivanovo():
     basic = base + "&current=temperature_2m,apparent_temperature,precipitation_probability,weather_code&timezone=Europe/Moscow"
     data = None
     async with aiohttp.ClientSession() as session:
-        for url in (rich, basic):  # если расширенный запрос не прошёл, берём простой
+        for url in (rich, basic):
             try:
                 async with session.get(url, timeout=10) as resp:
                     if resp.status == 200:
@@ -360,33 +357,26 @@ async def get_fuel_prices(show_delta=False):
     except Exception:
         return "⚠️ Ошибка сети при запросе цен."
 
-# --- Свежесть новостей: только сегодня и вчера (по МСК) ---
+# --- Свежесть новостей ---
 def parse_rss_date(s):
-    """Строка pubDate из RSS -> datetime с часовым поясом, либо None."""
-    if not s:
-        return None
+    if not s: return None
     try:
         dt = parsedate_to_datetime(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=pytz.utc)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=pytz.utc)
         return dt
     except Exception:
         return None
 
 def is_fresh(dt) -> bool:
-    """True, если дата - сегодня или вчера по Москве. Нет даты - False."""
-    if dt is None:
-        return False
+    if dt is None: return False
     today = datetime.now(MSK_TZ).date()
     return (today - dt.astimezone(MSK_TZ).date()).days in (0, 1)
 
 def vk_post_is_fresh(text_div) -> bool:
-    """Ищет дату поста ВК рядом с текстом: 'сегодня', 'вчера', 'N часов назад'."""
     node = text_div
     for _ in range(6):
         node = node.parent
-        if node is None:
-            return False
+        if node is None: return False
         d = node.find(class_="rel_date") or node.find(class_="wi_date")
         if d:
             t = d.get_text(" ", strip=True).lower()
@@ -422,7 +412,7 @@ async def get_fuel_situation_news():
     if not found_news: return None
     return "📰 <b>Ситуация с топливом (новости):</b>\n\n" + "".join(f"🔸 {n}\n\n" for n in found_news[:3])
 
-# --- Маршруты и Трафик ---
+# --- Маршруты ---
 async def get_coords(session, address):
     query = address if any(city.lower() in address.lower() for city in REGION_CITIES.keys()) else f"Иваново, {address}"
     url = "https://nominatim.openstreetmap.org/search"
@@ -483,8 +473,6 @@ MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля
 DATE_RE = re.compile(r'\b(\d{1,2})\s+(' + '|'.join(MONTHS) + r')\b')
 
 def event_date_ok(text: str) -> bool:
-    """Если в тексте названа дата события (например, '20 ноября'), она не должна быть старше вчера.
-    Если дат нет, считаем новость подходящей."""
     today = datetime.now(MSK_TZ).date()
     dates = []
     for d, mon in DATE_RE.findall(text.lower()):
@@ -492,11 +480,10 @@ def event_date_ok(text: str) -> bool:
             dt = datetime(today.year, MONTHS[mon], int(d)).date()
         except ValueError:
             continue
-        if (dt - today).days > 7:  # например, '28 декабря' в январе - это прошлый год
+        if (dt - today).days > 7:
             dt = dt.replace(year=today.year - 1)
         dates.append(dt)
-    if not dates:
-        return True
+    if not dates: return True
     return (today - max(dates)).days <= 1
 
 CITY_PATTERNS = {
@@ -525,6 +512,18 @@ def find_city(text):
         if re.search(pattern, lower_text): return city
     return "Ивановская область"
 
+# --- Очистка и парсинг Telegram / VK ---
+def clean_telegram_text(text):
+    if not text: return ""
+    garbage_phrases = [
+        r"Иллюстрация создана ИИ", r"Фото:.*", r"Подписывайтесь.*", 
+        r"Проголосовать за канал.*", r"Прислать новость.*"
+    ]
+    for phrase in garbage_phrases:
+        text = re.sub(phrase, "", text, flags=re.IGNORECASE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 async def fetch_news(session, url):
     try:
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8) as resp:
@@ -536,7 +535,6 @@ async def fetch_news(session, url):
                 title_tag = item.find('title')
                 if not title_tag: continue
 
-                # html.parser переводит имена тегов в нижний регистр: ищем 'pubdate', а не 'pubDate'
                 date_tag = item.find('pubdate')
                 dt = parse_rss_date(date_tag.get_text(strip=True) if date_tag else None)
                 if not is_fresh(dt): continue
@@ -562,8 +560,8 @@ async def fetch_telegram_channel(session, channel_name):
             pattern = r'\b(затор|пробка|пробки|скопление|затруднено|перекрыт|стоит|дтп|авария)\b'
             found = []
             for wrap in soup.find_all("div", class_="tgme_widget_message_wrap"):
-                msg = wrap.find("div", class_="tgme_widget_message_text")
-                if not msg: continue
+                msg_divs = wrap.find_all("div", class_="tgme_widget_message_text")
+                if not msg_divs: continue
 
                 time_tag = wrap.find("time")
                 dt = None
@@ -572,11 +570,14 @@ async def fetch_telegram_channel(session, channel_name):
                     except ValueError: dt = None
                 if not is_fresh(dt): continue
 
-                text = msg.get_text(separator='\n', strip=True)
-                if not event_date_ok(text): continue
-                lower_text = text.lower()
+                raw_text = "\n".join([div.get_text(separator='\n', strip=True) for div in msg_divs])
+                clean_text = clean_telegram_text(raw_text)
+                
+                if not event_date_ok(clean_text): continue
+                lower_text = clean_text.lower()
+                
                 if re.search(pattern, lower_text) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
-                    found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": format_time(dt)})
+                    found.append({"title": clean_text[:60] + "...", "full_text": clean_text, "city": find_city(clean_text), "time": format_time(dt)})
             return found
     except Exception: return []
 
@@ -589,15 +590,16 @@ async def fetch_vk_group(session, group_url):
             found = []
             for post in soup.find_all("div", class_="wall_post_text"):
                 if not vk_post_is_fresh(post): continue
-                text = post.get_text(separator='\n', strip=True)
-                if not event_date_ok(text): continue
-                if re.search(pattern, text.lower()):
-                    found.append({"title": text[:60] + "...", "full_text": text, "city": find_city(text), "time": "Сегодня/вчера"})
+                raw_text = post.get_text(separator='\n', strip=True)
+                clean_text = clean_telegram_text(raw_text)
+                
+                if not event_date_ok(clean_text): continue
+                if re.search(pattern, clean_text.lower()):
+                    found.append({"title": clean_text[:60] + "...", "full_text": clean_text, "city": find_city(clean_text), "time": "Сегодня/вчера"})
             return found
     except Exception: return []
 
 async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=True):
-    # Очищаем старые записи раз в сутки (при вызове)
     cleanup_old_news()
     
     sources = ["https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/", "https://iv-news.ru/"]
@@ -606,7 +608,6 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
         tasks = [fetch_news(session, url) for url in sources]
         for res in await asyncio.gather(*tasks): all_news.extend(res)
         
-        # Добавили канал "Иваново. Происшествия"
         tg_channels = ["ivanovonewsBars", "typical_kineshma", "kineshemec_ru", "ivanovo_proisshestvia"]
         tg_tasks = [fetch_telegram_channel(session, ch) for ch in tg_channels]
         for res in await asyncio.gather(*tg_tasks): all_news.extend(res)
@@ -619,9 +620,14 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
         
     unique_news = []
     for news in all_news:
-        # Проверяем на дубли внутри самой пачки
-        words_new = set(w.strip(".,!?\"'()-") for w in news["title"].lower().split() if len(w) > 3)
-        if not any(len(words_new.intersection(set(w.strip(".,!?\"'()-") for w in ex["title"].lower().split() if len(w) > 3))) >= 3 for ex in unique_news):
+        words_new = set(w.strip(".,!?\"'()-").lower() for w in news["full_text"].split() if len(w) > 4)
+        is_dup = False
+        for ex in unique_news:
+            words_ex = set(w.strip(".,!?\"'()-").lower() for w in ex["full_text"].split() if len(w) > 4)
+            if len(words_new.intersection(words_ex)) >= 4:
+                is_dup = True
+                break
+        if not is_dup:
             unique_news.append(news)
             
     filtered_news = []
@@ -629,15 +635,12 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
         impact_text, is_high = infer_traffic_impact(news["title"] + " " + news.get("full_text", ""))
         news["impact_text"] = impact_text
         
-        # Географический фильтр
         if is_high or news["city"] == "Ивановская область" or news["city"] in user_cities or ("Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION) or ("Иваново" not in user_cities and news["city"] == "Иваново"):
-            
-            # Проверяем, видел ли пользователь это
-            news_hash = generate_hash(news["full_text"])  # Хэш по полному тексту
+            news_hash = generate_hash(news["full_text"])
             if not is_news_seen(user_id, news_hash):
                 filtered_news.append(news)
                 if mark_seen:
-                    mark_news_as_seen(user_id, news_hash)  # Запоминаем, что показали
+                    mark_news_as_seen(user_id, news_hash)
             
     if not filtered_news: return "✅ <b>Свежих сообщений о заторах в выбранных городах нет (все уже прочитаны).</b>"
     
@@ -645,11 +648,8 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
     if is_bad_weather: text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
     text += "\n"
     
-    for news in filtered_news[:5]:
-        # Если есть полный текст, берем его, иначе заголовок
+    for news in filtered_news[:10]:
         body_text = news.get("full_text", news["title"])
-        
-        # Делаем первую букву заглавной
         if body_text:
             body_text = body_text[0].upper() + body_text[1:]
             
@@ -680,7 +680,6 @@ async def broadcast_job():
                      f"{weather_text}\n\n{await get_region_weather(user_cities)}\n\n{fuel_text}\n\n")
         if fuel_news: full_text += f"{fuel_news}\n"
         
-        # Передаем user_id для индивидуальной фильтрации прочитанного
         full_text += f"{await get_traffic_summary(user_id, is_bad, user_cities)}"
         
         try: 
@@ -840,7 +839,6 @@ async def process_route_end(message: types.Message, state: FSMContext):
         if not route_data: return await wait_msg.edit_text("❌ Ошибка маршрута.")
         dist_km, base_min = route_data
     _, is_bad = await get_weather_ivanovo()
-    # mark_seen=False: маршрут не должен помечать новости «прочитанными»
     traffic_text = await get_traffic_summary(message.from_user.id, is_bad, get_user_cities(message.from_user.id), mark_seen=False)
     time_penalty = 10 if "🚨" in traffic_text else 0
     total_min = int(base_min + time_penalty)

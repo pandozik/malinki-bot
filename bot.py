@@ -5,6 +5,7 @@ import re
 import sqlite3
 import json
 import hashlib
+from math import radians, sin, cos, sqrt, atan2
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -163,6 +164,20 @@ REGION_CITIES = {
     "Плес": (57.4606, 41.5158), "Пучеж": (56.9833, 43.1667),
 }
 IVANOVO_AGGLOMERATION = ["Иваново", "Кохма", "Тейково", "Фурманов", "Шуя", "Приволжск"]
+
+# Известные стационарные камеры (примерные координаты)
+CAMERAS = [
+    {"name": "Перекресток Ленина / Багаева", "lat": 56.9986, "lon": 40.9742},
+    {"name": "Проспект Строителей / Шубиных", "lat": 57.0021, "lon": 40.9613},
+    {"name": "Лежневская / Громобоя", "lat": 56.9789, "lon": 40.9712},
+    {"name": "Уводьский мост", "lat": 57.0011, "lon": 40.9841},
+    {"name": "Шереметевский проспект", "lat": 57.0015, "lon": 40.9758},
+    {"name": "Улица Куконковых", "lat": 56.9923, "lon": 40.9582},
+    {"name": "Московское шоссе (въезд)", "lat": 56.9321, "lon": 40.9210},
+    {"name": "Кохомское шоссе", "lat": 56.9448, "lon": 41.0112},
+    {"name": "Тейковское шоссе", "lat": 56.9811, "lon": 40.9105},
+    {"name": "Улица Некрасова", "lat": 56.9995, "lon": 40.9851}
+]
 
 class RouteState(StatesGroup):
     waiting_for_start = State()
@@ -412,7 +427,15 @@ async def get_fuel_situation_news():
     if not found_news: return None
     return "📰 <b>Ситуация с топливом (новости):</b>\n\n" + "".join(f"🔸 {n}\n\n" for n in found_news[:3])
 
-# --- Маршруты ---
+# --- Маршруты и Камеры ---
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
+
 async def get_coords(session, address):
     query = address if any(city.lower() in address.lower() for city in REGION_CITIES.keys()) else f"Иваново, {address}"
     url = "https://nominatim.openstreetmap.org/search"
@@ -426,11 +449,17 @@ async def get_coords(session, address):
 async def get_route_info(session, start_coords, end_coords):
     start_lon, start_lat = start_coords[1], start_coords[0]
     end_lon, end_lat = end_coords[1], end_coords[0]
-    url = f"http://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}?overview=false"
+    # Запрашиваем геометрию маршрута (geojson)
+    url = f"http://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}?overview=full&geometries=geojson"
     try:
         async with session.get(url, timeout=10) as resp:
             data = await resp.json()
-            if data.get("routes"): return data["routes"][0]["distance"] / 1000, data["routes"][0]["duration"] / 60
+            if data.get("routes"):
+                route = data["routes"][0]
+                dist_km = route["distance"] / 1000
+                dur_min = route["duration"] / 60
+                geom = route["geometry"]["coordinates"] # [[lon, lat], ...]
+                return dist_km, dur_min, geom
     except Exception: pass
     return None
 
@@ -487,22 +516,14 @@ def event_date_ok(text: str) -> bool:
     return (today - max(dates)).days <= 1
 
 CITY_PATTERNS = {
-    "Иваново": r'иванов(?:о|е)\b',
-    "Шуя": r'\bшу(?:я|е|ю|и|ей)\b',
-    "Кинешма": r'кинешм(?:а|е|у|ы|ой)\b',
-    "Вичуга": r'вичуг(?:а|е|у|и|ой)\b',
-    "Тейково": r'тейков(?:о|е|а|у)\b',
-    "Фурманов": r'фурманов(?:е|а|у|ом)?\b',
-    "Кохма": r'кохм(?:а|е|у|ы|ой)\b',
-    "Родники": r'родник(?:и|ах|ов|ам)\b',
-    "Приволжск": r'приволжск(?:е|а|у|ом)?\b',
-    "Заволжск": r'заволжск(?:е|а|у|ом)?\b',
-    "Наволоки": r'наволок(?:и|ах|ов|ам)\b',
-    "Юрьевец": r'юрьев(?:ец|ц(?:е|а|у|ем))\b',
-    "Южа": r'\bюж(?:а|е|у|ей)\b',
-    "Гаврилов Посад": r'гаврилов[- ]посад',
-    "Комсомольск": r'комсомольск(?:е|а|у|ом)?\b',
-    "Плес": r'\bпл[её]с(?:е|а|у|ом)?\b',
+    "Иваново": r'иванов(?:о|е)\b', "Шуя": r'\bшу(?:я|е|ю|и|ей)\b',
+    "Кинешма": r'кинешм(?:а|е|у|ы|ой)\b', "Вичуга": r'вичуг(?:а|е|у|и|ой)\b',
+    "Тейково": r'тейков(?:о|е|а|у)\b', "Фурманов": r'фурманов(?:е|а|у|ом)?\b',
+    "Кохма": r'кохм(?:а|е|у|ы|ой)\b', "Родники": r'родник(?:и|ах|ов|ам)\b',
+    "Приволжск": r'приволжск(?:е|а|у|ом)?\b', "Заволжск": r'заволжск(?:е|а|у|ом)?\b',
+    "Наволоки": r'наволок(?:и|ах|ов|ам)\b', "Юрьевец": r'юрьев(?:ец|ц(?:е|а|у|ем))\b',
+    "Южа": r'\bюж(?:а|е|у|ей)\b', "Гаврилов Посад": r'гаврилов[- ]посад',
+    "Комсомольск": r'комсомольск(?:е|а|у|ом)?\b', "Плес": r'\bпл[её]с(?:е|а|у|ом)?\b',
     "Пучеж": r'пучеж(?:е|а|у|ом)?\b',
 }
 
@@ -631,6 +652,8 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
             unique_news.append(news)
             
     filtered_news = []
+    jam_streets = set()
+    
     for news in unique_news:
         impact_text, is_high = infer_traffic_impact(news["title"] + " " + news.get("full_text", ""))
         news["impact_text"] = impact_text
@@ -639,12 +662,26 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
             news_hash = generate_hash(news["full_text"])
             if not is_news_seen(user_id, news_hash):
                 filtered_news.append(news)
+                # Собираем улицы для блока пробок
+                if is_high or "затор" in news["full_text"].lower() or "пробка" in news["full_text"].lower():
+                    street = extract_street(news["full_text"])
+                    if street: jam_streets.add(street)
+                
                 if mark_seen:
                     mark_news_as_seen(user_id, news_hash)
             
     if not filtered_news: return "✅ <b>Свежих сообщений о заторах в выбранных городах нет (все уже прочитаны).</b>"
     
+    # Вычисляем условный балл пробок
+    jam_level = min(10, 2 + len(filtered_news) * 2)
+    
     text = "🚨 <b>Дорожная обстановка:</b>\n"
+    if jam_streets:
+        text += f"📊 Условный уровень пробок: <b>{jam_level}/10</b>\n"
+        text += f"📍 Улицы с затруднениями: <b>{', '.join(list(jam_streets)[:5])}</b>\n\n"
+    else:
+        text += f"📊 Уровень пробок: <b>Низкий</b>\n\n"
+        
     if is_bad_weather: text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
     text += "\n"
     
@@ -717,9 +754,9 @@ async def cmd_start(message: types.Message):
         "📌 <b>Что я умею:</b>\n"
         "🌤 <b>Погода</b> — прогноз и состояние дорог.\n"
         "🌍 <b>Города</b> — погода в выбранных городах.\n"
-        "🚦 <b>ДТП и Заторы</b> — оперативные новости за сегодня и вчера, без повторов.\n"
+        "🚦 <b>ДТП и Заторы</b> — оперативные новости, балл пробок и улицы.\n"
         "⛽ <b>Бензин</b> — цены и новости.\n"
-        "🗺 <b>Маршрут</b> — расчет времени в пути.\n"
+        "🗺 <b>Маршрут</b> — расчет времени в пути и <b>предупреждение о камерах!</b>\n"
         "\n"
         "⚙️ <b>Настройки:</b> Выбери города и настрой до 3-х времен для рассылки.\n\n"
         "👇 <i>Используй кнопки меню внизу экрана.</i>"
@@ -831,19 +868,42 @@ async def process_route_end(message: types.Message, state: FSMContext):
     end_point, data = message.text, await state.get_data()
     start_point = data.get("start_point")
     await state.clear()
-    wait_msg = await message.answer("⏳ Строю маршрут...")
+    wait_msg = await message.answer("⏳ Строю маршрут и проверяю камеры...")
+    
     async with aiohttp.ClientSession() as session:
         start_coords, end_coords = await get_coords(session, start_point), await get_coords(session, end_point)
         if not start_coords or not end_coords: return await wait_msg.edit_text("❌ Адрес не найден.")
+        
         route_data = await get_route_info(session, start_coords, end_coords)
         if not route_data: return await wait_msg.edit_text("❌ Ошибка маршрута.")
-        dist_km, base_min = route_data
+        
+        dist_km, base_min, geom = route_data
+
+    # Проверка камер на маршруте
+    cameras_on_route = []
+    for i in range(0, len(geom), 10):
+        lon, lat = geom[i]
+        for cam in CAMERAS:
+            if haversine(lat, lon, cam["lat"], cam["lon"]) < 0.2: # 200 метров
+                if cam["name"] not in cameras_on_route:
+                    cameras_on_route.append(cam["name"])
+
+    camera_warning = ""
+    if cameras_on_route:
+        camera_warning = "\n📸 <b>Внимание, камеры на маршруте:</b>\n" + "\n".join(f"— {c}" for c in cameras_on_route[:5]) + "\n"
+
     _, is_bad = await get_weather_ivanovo()
     traffic_text = await get_traffic_summary(message.from_user.id, is_bad, get_user_cities(message.from_user.id), mark_seen=False)
     time_penalty = 10 if "🚨" in traffic_text else 0
+    
     total_min = int(base_min + time_penalty)
-    time_str = f"{total_min // 60} ч {total_min % 60} мин"
-    await wait_msg.edit_text(f"🗺 <b>Маршрут:</b>\n{start_point.capitalize()} ➡️ {end_point.capitalize()}\n📏 {dist_km:.1f} км\n⏱ {time_str}", parse_mode="HTML")
+    hours, mins = total_min // 60, total_min % 60
+    time_str = f"{hours} ч {mins} мин" if hours > 0 else f"{mins} мин"
+
+    result_text = (f"🗺 <b>Маршрут:</b>\n{start_point.capitalize()} ➡️ {end_point.capitalize()}\n"
+                   f"📏 <b>Расстояние:</b> {dist_km:.1f} км\n⏱ <b>Время:</b> {time_str}\n"
+                   f"{camera_warning}")
+    await wait_msg.edit_text(result_text, parse_mode="HTML")
 
 # --- Настройки городов ---
 @dp.callback_query(F.data == "select_all")
@@ -879,7 +939,7 @@ async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
     scheduler.add_job(broadcast_job, trigger='cron', minute='*')
     scheduler.start()
-    print("Бот запущен. Планировщик активен (проверка каждую минуту).")
+    print("Бот запущен. Планировщик активен.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

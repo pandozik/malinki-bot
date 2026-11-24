@@ -295,11 +295,10 @@ def get_bot_stats():
 
 @dp.message(Command("stats"))
 async def save_user_cities(message.from_user.id, get_user_cities(message.from_user.id))cmd_stats(message: types.Message):
-    # ВСТАВЬ СЮДА СВОЙ ID ВМЕСТО 123456789
     ADMIN_ID = 5007806242
     
-    if message.from_user.id != ADMIN_ID:
-        return # Если пишет не админ, бот игнорирует команду
+    if message.from_user.id != ADMIN_ID:5007806242
+        return 
         
     total, subs = get_bot_stats()
     await message.answer(

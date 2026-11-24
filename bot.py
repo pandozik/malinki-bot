@@ -277,36 +277,6 @@ def get_road_condition(code, temp, humidity, precip_now, precip24, snow24, min24
 def _num(x, default=0.0):
     return default if x is None else x
 
-# --- Статистика для админа ---
-def get_bot_stats():
-    conn = sqlite3.connect("users.db")
-    cursor = conn.cursor()
-    
-    # Считаем всех, кто есть в базе
-    cursor.execute("SELECT COUNT(*) FROM user_settings")
-    total_users = cursor.fetchone()[0]
-    
-    # Считаем тех, у кого настроена рассылка
-    cursor.execute("SELECT COUNT(*) FROM user_settings WHERE broadcast_times IS NOT NULL AND broadcast_times != '[]'")
-    active_subs = cursor.fetchone()[0]
-    
-    conn.close()
-    return total_users, active_subs
-
-@dp.message(Command("stats"))
-async def save_user_cities(message.from_user.id, get_user_cities(message.from_user.id))cmd_stats(message: types.Message):
-    ADMIN_ID = 5007806242
-    
-    if message.from_user.id != ADMIN_ID:5007806242
-        return 
-        
-    total, subs = get_bot_stats()
-    await message.answer(
-        f"📊 <b>Статистика бота:</b>\n\n"
-        f"👥 Всего пользователей в базе: <b>{total}</b>\n"
-        f"⏰ Активных подписчиков на рассылку: <b>{subs}</b>",
-        parse_mode="HTML"
-    )
 async def get_weather_ivanovo():
     lat, lon = REGION_CITIES["Иваново"]
     base = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"

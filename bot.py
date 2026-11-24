@@ -800,6 +800,7 @@ def get_routes_keyboard(user_id):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
 save_user_cities(message.from_user.id, get_user_cities(message.from_user.id))
+
     intro_text = (
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
         "Я — твой персональный помощник по <b>Ивановской области</b>.\n\n"

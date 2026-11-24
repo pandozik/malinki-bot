@@ -24,6 +24,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+ADMIN_ID = 5007806242  # Твой ID для статистики
 
 CITY_NAME = "Иваново"
 MSK_TZ = pytz.timezone("Europe/Moscow")
@@ -51,7 +52,6 @@ def init_db():
             PRIMARY KEY (user_id, news_hash)
         )
     """)
-    # Новая таблица для сохранения маршрутов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS saved_routes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,6 +166,17 @@ def cleanup_old_news():
     conn.commit()
     conn.close()
 
+# --- Статистика ---
+def get_bot_stats():
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM user_settings")
+    total_users = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM user_settings WHERE broadcast_times IS NOT NULL AND broadcast_times != '[]'")
+    active_subs = cursor.fetchone()[0]
+    conn.close()
+    return total_users, active_subs
+
 # --- Топливо ---
 def get_yesterday_fuel():
     conn = sqlite3.connect("users.db")
@@ -197,7 +208,6 @@ REGION_CITIES = {
 }
 IVANOVO_AGGLOMERATION = ["Иваново", "Кохма", "Тейково", "Фурманов", "Шуя", "Приволжск"]
 
-# Известные стационарные камеры
 CAMERAS = [
     {"name": "Перекресток Ленина / Багаева", "lat": 56.9986, "lon": 40.9742},
     {"name": "Проспект Строителей / Шубиных", "lat": 57.0021, "lon": 40.9613},
@@ -276,38 +286,6 @@ def get_road_condition(code, temp, humidity, precip_now, precip24, snow24, min24
 
 def _num(x, default=0.0):
     return default if x is None else x
-    
-# --- Статистика для админа ---
-def get_bot_stats():
-    conn = sqlite3.connect("users.db")
-    cursor = conn.cursor()
-    
-    # Считаем всех, кто есть в базе
-    cursor.execute("SELECT COUNT(*) FROM user_settings")
-    total_users = cursor.fetchone()[0]
-    
-    # Считаем тех, у кого настроена рассылка
-    cursor.execute("SELECT COUNT(*) FROM user_settings WHERE broadcast_times IS NOT NULL AND broadcast_times != '[]'")
-    active_subs = cursor.fetchone()[0]
-    
-    conn.close()
-    return total_users, active_subs
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    # ВСТАВЬ СЮДА СВОЙ ID ВМЕСТО 123456789
-    ADMIN_ID = 5007806242
-    
-    if message.from_user.id != ADMIN_ID:
-        return # Если пишет не админ, бот игнорирует команду
-        
-    total, subs = get_bot_stats()
-    await message.answer(
-        f"📊 <b>Статистика бота:</b>\n\n"
-        f"👥 Всего пользователей в базе: <b>{total}</b>\n"
-        f"⏰ Активных подписчиков на рассылку: <b>{subs}</b>",
-        parse_mode="HTML"
-    )
 
 async def get_weather_ivanovo():
     lat, lon = REGION_CITIES["Иваново"]
@@ -697,63 +675,44 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
         text += f"🏙 <b>Город:</b> {news['city']}.\n🕒 <b>Опубликовано:</b> {news['time']}\n🚦 <b>Влияние:</b> {news['impact_text']}\n➖➖➖➖➖➖➖➖\n\n"
     return text
 
-# --- Универсальная функция расчета маршрута ---
 async def calculate_and_send_route(user_id, start_point, end_point, send_func):
     wait_msg = await send_func("⏳ Строю маршрут, проверяю камеры и погоду...")
-    
     async with aiohttp.ClientSession() as session:
         start_coords, end_coords = await get_coords(session, start_point), await get_coords(session, end_point)
-        if not start_coords or not end_coords: 
-            return await wait_msg.edit_text("❌ Адрес не найден. Попробуйте указать точнее.")
-        
+        if not start_coords or not end_coords: return await wait_msg.edit_text("❌ Адрес не найден. Попробуйте указать точнее.")
         route_data = await get_route_info(session, start_coords, end_coords)
-        if not route_data: 
-            return await wait_msg.edit_text("❌ Ошибка маршрута.")
-        
+        if not route_data: return await wait_msg.edit_text("❌ Ошибка маршрута.")
         dist_km, base_min, geom = route_data
 
-    # Проверка камер
     cameras_on_route = []
     for i in range(0, len(geom), 10):
         lon, lat = geom[i]
         for cam in CAMERAS:
             if haversine(lat, lon, cam["lat"], cam["lon"]) < 0.2:
-                if cam["name"] not in cameras_on_route:
-                    cameras_on_route.append(cam["name"])
+                if cam["name"] not in cameras_on_route: cameras_on_route.append(cam["name"])
 
     camera_warning = ""
     if cameras_on_route:
         camera_warning = "\n📸 <b>Камеры на пути:</b>\n" + "\n".join(f"— {c}" for c in cameras_on_route[:5]) + "\n"
 
-    # Погода и Трафик
     weather_text, is_bad = await get_weather_ivanovo()
     traffic_text = await get_traffic_summary(user_id, is_bad, get_user_cities(user_id), mark_seen=False)
-    
     time_penalty = 10 if "🚨" in traffic_text else 0
     total_min = int(base_min + time_penalty)
     hours, mins = total_min // 60, total_min % 60
     time_str = f"{hours} ч {mins} мин" if hours > 0 else f"{mins} мин"
-
-    # Извлекаем погоду для маршрута
     weather_short = "✅ Дороги сухие" if not is_bad else "⚠️ Дороги скользкие/мокрые"
 
     result_text = (
         f"🗺 <b>Маршрут:</b> {start_point.capitalize()} ➡️ {end_point.capitalize()}\n"
-        f"📏 <b>Расстояние:</b> {dist_km:.1f} км\n"
-        f"⏱ <b>Время в пути:</b> {time_str}\n\n"
+        f"📏 <b>Расстояние:</b> {dist_km:.1f} км\n⏱ <b>Время в пути:</b> {time_str}\n\n"
         f"🌤 <b>Условия:</b> {weather_short}\n"
         f"🚦 <b>Трафик:</b> {'Есть ДТП, возможны задержки (+10 мин)' if time_penalty else 'Свободно'}\n"
         f"{camera_warning}"
     )
-    
-    # Кнопка сохранения
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data=f"save_route_{start_point[:10]}_{end_point[:10]}")]
-    ])
-    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data=f"save_route_{start_point[:10]}_{end_point[:10]}")]])
     await wait_msg.edit_text(result_text, parse_mode="HTML", reply_markup=keyboard)
 
-# --- Рассылка ---
 async def broadcast_job():
     current_time = datetime.now(MSK_TZ).strftime("%H:%M")
     users = get_users_for_broadcast(current_time)
@@ -772,10 +731,8 @@ async def broadcast_job():
         try: await bot.send_message(user_id, full_text, parse_mode="HTML")
         except Exception: pass
 
-# --- Клавиатуры ---
 def get_cities_keyboard(user_cities: list):
-    keyboard = []
-    keyboard.append([InlineKeyboardButton(text="✅ Выбрать ВСЕ", callback_data="select_all"), InlineKeyboardButton(text="❌ Очистить", callback_data="clear_all")])
+    keyboard = [[InlineKeyboardButton(text="✅ Выбрать ВСЕ", callback_data="select_all"), InlineKeyboardButton(text="❌ Очистить", callback_data="clear_all")]]
     row = []
     for city in REGION_CITIES.keys():
         btn_text = f"✅ {city}" if city in user_cities else city
@@ -788,21 +745,27 @@ def get_cities_keyboard(user_cities: list):
 
 def get_routes_keyboard(user_id):
     routes = get_saved_routes(user_id)
-    keyboard = []
-    for r_id, name, start, end in routes:
-        keyboard.append([InlineKeyboardButton(text=f"⭐ {name} ({start} ➡️ {end})", callback_data=f"run_route_{r_id}")])
-    
+    keyboard = [[InlineKeyboardButton(text=f"⭐ {name} ({start} ➡️ {end})", callback_data=f"run_route_{r_id}")] for r_id, name, start, end in routes]
     keyboard.append([InlineKeyboardButton(text="➕ Построить новый маршрут", callback_data="new_route")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 # --- Хэндлеры ---
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    total, subs = get_bot_stats()
+    await message.answer(
+        f"📊 <b>Статистика бота:</b>\n\n"
+        f"👥 Всего пользователей в базе: <b>{total}</b>\n"
+        f"⏰ Активных подписчиков на рассылку: <b>{subs}</b>",
+        parse_mode="HTML"
+    )
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-
-save_user_cities(message.from_user.id,
-get_user_cities(message.from_user.id))
-
+    save_user_cities(message.from_user.id, get_user_cities(message.from_user.id)) # Сохраняем каждого
     intro_text = (
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
         "Я — твой персональный помощник по <b>Ивановской области</b>.\n\n"
@@ -859,9 +822,7 @@ async def cmd_settings(message: types.Message):
 async def menu_broadcast_time(message: types.Message, state: FSMContext):
     times = get_user_times(message.from_user.id)
     text = f"⏰ Ваши времена: {', '.join(times)} (МСК).\n\n" if times else "⏰ У вас пока не настроена рассылка.\n\n"
-    text += ("Напишите время в формате <code>ЧЧ:ММ</code> (например, <code>07:30</code>).\n"
-             "Доступно до <b>3-х</b> слотов.\n\n"
-             "Чтобы <b>удалить все</b>, напишите <code>0</code>.")
+    text += ("Напишите время в формате <code>ЧЧ:ММ</code> (например, <code>07:30</code>).\nДоступно до <b>3-х</b> слотов.\n\nЧтобы <b>удалить все</b>, напишите <code>0</code>.")
     await state.set_state(BroadcastState.waiting_for_time)
     await message.answer(text, parse_mode="HTML")
 
@@ -884,16 +845,13 @@ async def process_broadcast_time(message: types.Message, state: FSMContext):
         await message.answer(f"✅ Время <b>{text}</b> добавлено!\nРассылки: {', '.join(times)}.", parse_mode="HTML")
     else: await message.answer("❌ Неверный формат. Напишите <code>ЧЧ:ММ</code> или <code>0</code>.", parse_mode="HTML")
 
-# --- Маршруты ---
 @dp.message(F.text == "🗺 Маршрут")
 async def menu_route(message: types.Message, state: FSMContext):
     await state.clear()
     routes = get_saved_routes(message.from_user.id)
     text = "🗺 <b>Управление маршрутами</b>\n\n"
-    if routes:
-        text += "Выберите сохраненный маршрут или постройте новый:"
-    else:
-        text += "У вас пока нет сохраненных маршрутов. Постройте первый!"
+    if routes: text += "Выберите сохраненный маршрут или постройте новый:"
+    else: text += "У вас пока нет сохраненных маршрутов. Постройте первый!"
     await message.answer(text, reply_markup=get_routes_keyboard(message.from_user.id), parse_mode="HTML")
 
 @dp.callback_query(F.data == "new_route")
@@ -922,16 +880,11 @@ async def run_saved_route(callback: CallbackQuery):
     cursor.execute("SELECT start_point, end_point FROM saved_routes WHERE id = ?", (route_id,))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        await calculate_and_send_route(callback.from_user.id, row[0], row[1], callback.message.edit_text)
-    else:
-        await callback.answer("Маршрут не найден", show_alert=True)
+    if row: await calculate_and_send_route(callback.from_user.id, row[0], row[1], callback.message.edit_text)
+    else: await callback.answer("Маршрут не найден", show_alert=True)
 
 @dp.callback_query(F.data.startswith("save_route_"))
 async def ask_route_name(callback: CallbackQuery, state: FSMContext):
-    data = callback.data.split("_")
-    # Восстанавливаем start и end (они могут быть обрезаны, поэтому берем из FSM или callback)
-    # Лучше брать из FSM, но для простоты передадим в callback (немного костыльно, но работает)
     await callback.message.edit_text("💾 <b>Как назовем этот маршрут?</b>\nНапример: «Работа», «Домой», «Дача».")
     await state.set_state(RouteState.waiting_for_route_name)
     await callback.answer()
@@ -949,7 +902,6 @@ async def save_route_name(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Не удалось сохранить маршрут. Попробуйте построить заново.")
     await state.clear()
 
-# --- Настройки городов ---
 @dp.callback_query(F.data == "select_all")
 async def process_select_all(callback: CallbackQuery):
     all_cities = list(REGION_CITIES.keys())
@@ -978,7 +930,6 @@ async def process_save_settings(callback: CallbackQuery):
     await callback.message.edit_text("✅ Настройки городов сохранены!")
     await callback.answer()
 
-# --- Запуск ---
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
     scheduler.add_job(broadcast_job, trigger='cron', minute='*')

@@ -136,6 +136,67 @@ CAMERAS = [
     {"name": "Тейковское шоссе", "lat": 56.9811, "lon": 40.9105}, {"name": "Улица Некрасова", "lat": 56.9995, "lon": 40.9851}
 ]
 
+CITY_PATTERNS = {
+    "Иваново": r'\bиванов(?:о|е|а|у|ым)\b',
+    "Шуя": r'\bшу(?:я|е|ю|и|ей)\b',
+    "Кинешма": r'кинешм(?:а|е|у|ы|ой)\b',
+    "Вичуга": r'вичуг(?:а|е|у|и|ой)\b',
+    "Тейково": r'тейков(?:о|е|а|у)\b',
+    "Фурманов": r'фурманов(?:е|а|у|ом)?\b',
+    "Кохма": r'кохм(?:а|е|у|ы|ой)\b',
+    "Родники": r'родник(?:и|ах|ов|ам)\b',
+    "Приволжск": r'приволжск(?:е|а|у|ом)?\b',
+    "Заволжск": r'заволжск(?:е|а|у|ом)?\b',
+    "Наволоки": r'наволок(?:и|ах|ов|ам)\b',
+    "Юрьевец": r'юрьев(?:ец|це|ца|цу)\b',
+    "Южа": r'\bюж(?:а|е|у|ей)\b',
+    "Гаврилов Посад": r'гаврилов[- ]посад',
+    "Комсомольск": r'комсомольск(?:е|а|у|ом)?\b',
+    "Плес": r'\bпл[её]с(?:е|а|у|ом)?\b',
+    "Пучеж": r'пучеж(?:е|а|у|ом)?\b',
+}
+
+OBLAST_DISTRICTS = {
+    "Ивановский район": r'ивановск(?:ом|ого|ий|ому)\s+район',
+    "Шуйский район": r'шуйск(?:ом|ого|ий|ому)\s+район',
+    "Кинешемский район": r'кинешемск(?:ом|ого|ий|ому)\s+район',
+    "Вичугский район": r'вичугск(?:ом|ого|ий|ому)\s+район',
+    "Тейковский район": r'тейковск(?:ом|ого|ий|ому)\s+район',
+    "Фурмановский район": r'фурмановск(?:ом|ого|ий|ому)\s+район',
+    "Родниковский район": r'родниковск(?:ом|ого|ий|ому)\s+район',
+    "Приволжский район": r'приволжск(?:ом|ого|ий|ому)\s+район',
+    "Заволжский район": r'заволжск(?:ом|ого|ий|ому)\s+район',
+    "Юрьевецкий район": r'юрьевецк(?:ом|ого|ий|ому)\s+район',
+    "Южский район": r'южск(?:ом|ого|ий|ому)\s+район',
+    "Гаврилово-Посадский район": r'гаврилово[- ]посадск(?:ом|ого|ий|ому)\s+район',
+    "Комсомольский район": r'комсомольск(?:ом|ого|ий|ому)\s+район',
+    "Пучежский район": r'пучежск(?:ом|ого|ий|ому)\s+район',
+    "Палехский район": r'палехск(?:ом|ого|ий|ому)\s+район',
+    "Пестяковский район": r'пестяковск(?:ом|ого|ий|ому)\s+район',
+    "Лухский район": r'лухск(?:ом|ого|ий|ому)\s+район',
+    "Верхнеландеховский район": r'верхнеландеховск(?:ом|ого|ий|ому)\s+район',
+    "Ильинский район": r'ильинск(?:ом|ого|ий|ому)\s+район',
+    "Лежневский район": r'лежневск(?:ом|ого|ий|ому)\s+район',
+    "Савинский район": r'савинск(?:ом|ого|ий|ому)\s+район',
+}
+
+CITY_DISTRICTS = {
+    "Ленинский район": r'ленинск(?:ом|ого|ий|ому)\s+район',
+    "Октябрьский район": r'октябрьск(?:ом|ого|ий|ому)\s+район',
+    "Советский район": r'советск(?:ом|ого|ий|ому)\s+район',
+    "Фрунзенский район": r'фрунзенск(?:ом|ого|ий|ому)\s+район',
+    "мкр. Авдотьино": r'авдотьин[оеа]',
+    "мкр. Сортировка": r'сортировк[аеу]',
+    "мкр. Московский": r'московск(?:ий|ом)\s+микрорайон',
+    "мкр. Суховка": r'суховк[аеу]',
+    "Местечко Пустошь-Бор": r'пустошь[- ]бор',
+    "Местечко Балино": r'балин[ое]',
+    "Местечко Минеево": r'минеев[ое]',
+    "Местечко Курьяново": r'курьянов[ое]',
+}
+
+THEFT_PATTERN = r'\b(угон\w*|угнал\w*|похищ\w*\s+(?:авто|машин|транспорт|ваз|лада|иномарк)|похитил\w*\s+(?:авто|машин|транспорт)|розыск\w*\s+(?:авто|машин|транспорт)|краж\w*\s+(?:авто|машин))\b'
+
 class RouteState(StatesGroup):
     waiting_for_start = State(); waiting_for_end = State(); waiting_for_route_name = State()
 class BroadcastState(StatesGroup):
@@ -144,7 +205,7 @@ class BroadcastState(StatesGroup):
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🌤 Погода"), KeyboardButton(text="🌍 Города")],
-        [KeyboardButton(text="🚦 ДТП и Заторы"), KeyboardButton(text="⛽ Бензин")],
+        [KeyboardButton(text="🚦 ДТП, Заторы, Угоны"), KeyboardButton(text="⛽ Бензин")],
         [KeyboardButton(text="🗺 Маршрут"), KeyboardButton(text="🗂 Всё сразу")],
         [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="⏰ Время рассылки")]
     ], resize_keyboard=True)
@@ -202,7 +263,6 @@ def _num(x, default=0.0): return default if x is None else x
 async def get_weather_ivanovo():
     lat, lon = REGION_CITIES["Иваново"]
     base = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-    # Запрашиваем прогноз на 12 часов вперед (past_hours=24 & forecast_hours=12)
     url = (base + "&current=temperature_2m,apparent_temperature,precipitation_probability,weather_code,relative_humidity_2m,precipitation"
            "&hourly=precipitation,snowfall,rain,temperature_2m,visibility&past_hours=24&forecast_hours=12&timezone=Europe/Moscow")
     async with aiohttp.ClientSession() as session:
@@ -223,7 +283,6 @@ async def get_weather_ivanovo():
 
     precip_list = hourly.get("precipitation", [])
     snow_list = hourly.get("snowfall", [])
-    rain_list = hourly.get("rain", [])
     
     precip24 = sum(_num(v) for v in precip_list[0:24])
     snow24 = sum(_num(v) for v in snow_list[0:24])
@@ -232,7 +291,6 @@ async def get_weather_ivanovo():
     vis_list = [v for v in hourly.get("visibility", [])[0:24] if v is not None]
     visibility = vis_list[-1] if vis_list else None
 
-    # Расчет длительности осадков (смотрим с 24 индекса вперед)
     duration_text = ""
     if precip_now > 0:
         hours_left = 0
@@ -395,7 +453,7 @@ async def get_weather_news():
     if not found_news: return None
     return "🌪 <b>Погодные предупреждения:</b>\n" + "".join(f"⚠️ {n}\n\n" for n in found_news[:3])
 
-# --- Маршруты ---
+# --- Маршруты и локации ---
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0; dlat = math.radians(lat2 - lat1); dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
@@ -425,18 +483,69 @@ async def get_route_info(session, start_coords, end_coords):
     return None
 
 def extract_street(text):
-    patterns = [r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)', r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:ой|ий|ая|ое|ые))', r'в\s+([А-ЯЁ][а-яё]+ском)\s+районе', r'\b([А-ЯЁ][а-яё]+ская)\b', r'(?:перекрёст(?:ок|ке)|развязк[ае])\s+(?:улиц\s+)?([А-ЯЁ][а-яё]+)', r'(?:мост[ау]?|путепровод[ау]?)\s+(?:на\s+)?([А-ЯЁ][а-яё]+)']
+    patterns = [
+        r'(?:ул(?:ица|\.)?|проспект|пр-т|переулок|пер\.|шоссе|пл(?:ощадь|\.)?|мкр(?:орайон|\.)?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)',
+        r'на\s+(?:улице\s+)?([А-ЯЁ][а-яё]+(?:ой|ий|ая|ое|ые))',
+        r'в\s+([А-ЯЁ][а-яё]+ском)\s+районе',
+        r'\b([А-ЯЁ][а-яё]+ская)\b',
+        r'(?:перекрёст(?:ок|ке)|развязк[ае])\s+(?:улиц\s+)?([А-ЯЁ][а-яё]+)',
+        r'(?:мост[ау]?|путепровод[ау]?)\s+(?:на\s+)?([А-ЯЁ][а-яё]+)'
+    ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
             street = match.group(1)
-            if street.lower() not in ["ивановская", "областная", "кинешемская", "шуйская"]: return street
+            if street.lower() not in ["ивановская", "областная", "кинешемская", "шуйская"]:
+                return street
     return None
 
-def infer_traffic_impact(text):
+def extract_location(text):
+    lower_text = text.lower()
+    city = None
+    district = None
+
+    for c_name, pattern in CITY_PATTERNS.items():
+        if re.search(pattern, lower_text):
+            city = c_name
+            break
+
+    for d_name, pattern in OBLAST_DISTRICTS.items():
+        if re.search(pattern, lower_text):
+            district = d_name
+            if not city:
+                base_city = d_name.split()[0].rstrip("ий").rstrip("ск")
+                for c_name in REGION_CITIES:
+                    if c_name.lower().startswith(base_city[:4]):
+                        city = c_name
+                        break
+            break
+
+    if not district:
+        for cd_name, pattern in CITY_DISTRICTS.items():
+            if re.search(pattern, lower_text):
+                district = cd_name
+                if not city:
+                    city = "Иваново"
+                break
+
+    if not district:
+        village_match = re.search(r'(?:дер(?:евне|\.)?|с(?:еле|\.)?|пос(?:ёлке|елке|\.)?|пгт\.?)\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)', text)
+        if village_match:
+            district = f"н.п. {village_match.group(1)}"
+
+    if not city:
+        city = "Ивановская область"
+
+    return city, district
+
+def infer_traffic_impact(text, is_theft=False):
+    if is_theft:
+        return "🚓 <b>Угон / Розыск авто.</b> Будьте внимательны!", False
     lower = text.lower()
-    if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет", "коллапс", "пострадал", "пьян", "встречк", "сбил"]): return "🔴 <b>Высокое</b>. Возможна пробка.", True
-    elif any(w in lower for w in ["дтп", "авари", "столкн", "скорая", "затор", "пробка", "скопление"]): return "🟠 <b>Среднее</b>. Замедление.", False
+    if any(w in lower for w in ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет", "коллапс", "пострадал", "пьян", "встречк", "сбил"]):
+        return "🔴 <b>Высокое</b>. Возможна пробка.", True
+    elif any(w in lower for w in ["дтп", "авари", "столкн", "скорая", "затор", "пробка", "скопление"]):
+        return "🟠 <b>Среднее</b>. Замедление.", False
     return "🟢 <b>Низкое</b>. Затруднений нет.", False
 
 def format_time(dt=None):
@@ -462,21 +571,6 @@ def event_date_ok(text: str) -> bool:
         dates.append(dt)
     return True if not dates else (today - max(dates)).days <= 1
 
-CITY_PATTERNS = {
-    "Иваново": r'иванов(?:о|е)\b', "Шуя": r'\bшу(?:я|е|ю|и|ей)\b', "Кинешма": r'кинешм(?:а|е|у|ы|ой)\b',
-    "Вичуга": r'вичуг(?:а|е|у|и|ой)\b', "Тейково": r'тейков(?:о|е|а|у)\b', "Фурманов": r'фурманов(?:е|а|у|ом)?\b',
-    "Кохма": r'кохм(?:а|е|у|ы|ой)\b', "Родники": r'родник(?:и|ах|ов|ам)\b', "Приволжск": r'приволжск(?:е|а|у|ом)?\b',
-    "Заволжск": r'заволжск(?:е|а|у|ом)?\b', "Наволоки": r'наволок(?:и|ах|ов|ам)\b', "Юрьевец": r'юрьев\b',
-    "Южа": r'\bюж(?:а|е|у|ей)\b', "Гаврилов Посад": r'гаврилов[- ]посад', "Комсомольск": r'комсомольск(?:е|а|у|ом)?\b',
-    "Плес": r'\bпл[её]с(?:е|а|у|ом)?\b', "Пучеж": r'пучеж(?:е|а|у|ом)?\b',
-}
-
-def find_city(text):
-    lower_text = text.lower()
-    for city, pattern in CITY_PATTERNS.items():
-        if re.search(pattern, lower_text): return city
-    return "Ивановская область"
-
 def clean_telegram_text(text):
     if not text: return ""
     for phrase in [r"Иллюстрация создана ИИ", r"Фото:.*", r"Подписывайтесь.*", r"Проголосовать за канал.*", r"Прислать новость.*"]:
@@ -487,7 +581,7 @@ async def fetch_news(session, url):
     try:
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8) as resp:
             soup = BeautifulSoup(await resp.text(), "html.parser")
-            pattern = r'\b(дтп|авари|пробк|затор|столкн|перекрыт|пострадал|скоплен)\b'
+            traffic_pattern = r'\b(дтп|авари|пробк|затор|столкн|перекрыт|пострадал|скоплен)\b'
             stop_words = ["украин", "москв", "петербург", "росси", "сша", "европ", "пробаци", "проблем"]
             found = []
             for item in soup.find_all('item'):
@@ -498,12 +592,25 @@ async def fetch_news(session, url):
                 if not is_fresh(dt): continue
                 text = title_tag.get_text(strip=True)
                 clean_desc = clean_html(item.find('description').get_text(strip=True) if item.find('description') else "")
-                if not event_date_ok(text + " " + clean_desc): continue
-                lower_text = (text + " " + clean_desc).lower()
-                if re.search(pattern, lower_text):
+                full_str = text + " " + clean_desc
+                if not event_date_ok(full_str): continue
+                lower_text = full_str.lower()
+
+                is_traffic = bool(re.search(traffic_pattern, lower_text))
+                is_theft = bool(re.search(THEFT_PATTERN, lower_text))
+
+                if is_traffic or is_theft:
                     if ("иванов" in lower_text or "област" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES)):
                         if not any(re.search(rf'\b{sw}\b', lower_text) for sw in stop_words):
-                            found.append({"title": text, "full_text": clean_desc, "time": format_time(dt), "city": find_city(lower_text)})
+                            city, district = extract_location(full_str)
+                            found.append({
+                                "title": text,
+                                "full_text": clean_desc or text,
+                                "time": format_time(dt),
+                                "city": city,
+                                "district": district,
+                                "is_theft": is_theft
+                            })
             return found
     except Exception: return []
 
@@ -513,7 +620,7 @@ async def fetch_telegram_channel(session, channel_name):
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10) as resp:
             if resp.status != 200: return []
             soup = BeautifulSoup(await resp.text(), "html.parser")
-            pattern = r'\b(затор|пробк|скоплен|затруднен|перекрыт|стоит|дтп|авари|столкн|сбил|вылет|опрокид|наезд)\b'
+            traffic_pattern = r'\b(затор|пробк|скоплен|затруднен|перекрыт|стоит|дтп|авари|столкн|сбил|вылет|опрокид|наезд)\b'
             found = []
             for wrap in soup.find_all("div", class_="tgme_widget_message_wrap"):
                 msg_divs = wrap.find_all("div", class_="tgme_widget_message_text")
@@ -528,8 +635,20 @@ async def fetch_telegram_channel(session, channel_name):
                 clean_text = clean_telegram_text(raw_text)
                 if not event_date_ok(clean_text): continue
                 lower_text = clean_text.lower()
-                if re.search(pattern, lower_text) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES) or "юрьев" in lower_text):
-                    found.append({"title": clean_text[:60] + "...", "full_text": clean_text, "city": find_city(clean_text), "time": format_time(dt)})
+
+                is_traffic = bool(re.search(traffic_pattern, lower_text))
+                is_theft = bool(re.search(THEFT_PATTERN, lower_text))
+
+                if (is_traffic or is_theft) and ("иванов" in lower_text or any(c.lower() in lower_text for c in REGION_CITIES) or "юрьев" in lower_text):
+                    city, district = extract_location(clean_text)
+                    found.append({
+                        "title": clean_text[:60] + "...",
+                        "full_text": clean_text,
+                        "city": city,
+                        "district": district,
+                        "time": format_time(dt),
+                        "is_theft": is_theft
+                    })
             return found
     except Exception: return []
 
@@ -538,15 +657,28 @@ async def fetch_vk_group(session, group_url):
         async with session.get(group_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10) as resp:
             if resp.status != 200: return []
             soup = BeautifulSoup(await resp.text(), "html.parser")
-            pattern = r'\b(затор|пробка|пробки|скопление|затруднено|перекрыт|дтп|авария|столкновение|сбил|вылет)\b'
+            traffic_pattern = r'\b(затор|пробка|пробки|скопление|затруднено|перекрыт|дтп|авария|столкновение|сбил|вылет)\b'
             found = []
             for post in soup.find_all("div", class_="wall_post_text"):
                 if not vk_post_is_fresh(post): continue
                 raw_text = post.get_text(separator='\n', strip=True)
                 clean_text = clean_telegram_text(raw_text)
                 if not event_date_ok(clean_text): continue
-                if re.search(pattern, clean_text.lower()):
-                    found.append({"title": clean_text[:60] + "...", "full_text": clean_text, "city": find_city(clean_text), "time": "Сегодня/вчера"})
+                lower_text = clean_text.lower()
+
+                is_traffic = bool(re.search(traffic_pattern, lower_text))
+                is_theft = bool(re.search(THEFT_PATTERN, lower_text))
+
+                if is_traffic or is_theft:
+                    city, district = extract_location(clean_text)
+                    found.append({
+                        "title": clean_text[:60] + "...",
+                        "full_text": clean_text,
+                        "city": city,
+                        "district": district,
+                        "time": "Сегодня/вчера",
+                        "is_theft": is_theft
+                    })
             return found
     except Exception: return []
 
@@ -564,44 +696,63 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
         vk_tasks = [fetch_vk_group(session, url) for url in vk_urls]
         for res in await asyncio.gather(*vk_tasks): all_news.extend(res)
 
-    if not all_news: return "✅ <b>Свежих сообщений о ДТП нет (за сегодня и вчера).</b>"
+    if not all_news:
+        return "✅ <b>Свежих сообщений о ДТП и угонах нет (за сегодня и вчера).</b>"
+
     unique_news = []
     for news in all_news:
         words_new = set(w.strip(".,!?\"'()-").lower() for w in news["full_text"].split() if len(w) > 4)
         if not any(len(words_new.intersection(set(w.strip(".,!?\"'()-").lower() for w in ex["full_text"].split() if len(w) > 4))) >= 4 for ex in unique_news):
             unique_news.append(news)
-            
-    filtered_news = []; jam_streets = set()
+
+    filtered_news = []
+    jam_streets = set()
+    traffic_events_count = 0
+
     for news in unique_news:
-        impact_text, is_high = infer_traffic_impact(news["title"] + " " + news.get("full_text", ""))
+        is_theft = news.get("is_theft", False)
+        impact_text, is_high = infer_traffic_impact(news["title"] + " " + news.get("full_text", ""), is_theft=is_theft)
         news["impact_text"] = impact_text
-        if is_high or news["city"] == "Ивановская область" or news["city"] in user_cities or ("Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION) or ("Иваново" not in user_cities and news["city"] == "Иваново"):
+
+        if is_theft or is_high or news["city"] == "Ивановская область" or news["city"] in user_cities or ("Иваново" in user_cities and news["city"] in IVANOVO_AGGLOMERATION) or ("Иваново" not in user_cities and news["city"] == "Иваново"):
             news_hash = generate_hash(news["full_text"])
             if not is_news_seen(user_id, news_hash):
                 filtered_news.append(news)
-                if is_high or "затор" in news["full_text"].lower() or "пробка" in news["full_text"].lower():
-                    street = extract_street(news["full_text"])
-                    if street: jam_streets.add(street)
-                if mark_seen: mark_news_as_seen(user_id, news_hash)
-            
-    if not filtered_news: return "✅ <b>Свежих сообщений о заторах нет (все прочитаны).</b>"
-    
-    jam_level = min(10, 2 + len(filtered_news) * 2)
-    text = "🚨 <b>Дорожная обстановка:</b>\n"
+                if not is_theft:
+                    traffic_events_count += 1
+                    if is_high or "затор" in news["full_text"].lower() or "пробка" in news["full_text"].lower():
+                        street = extract_street(news["full_text"])
+                        if street: jam_streets.add(street)
+                if mark_seen:
+                    mark_news_as_seen(user_id, news_hash)
+
+    if not filtered_news:
+        return "✅ <b>Свежих сообщений о заторах и угонах нет (все прочитаны).</b>"
+
+    jam_level = min(10, 2 + traffic_events_count * 2) if traffic_events_count > 0 else 1
+    text = "🚨 <b>Дорожная обстановка и происшествия:</b>\n"
     if jam_streets:
         text += f"📊 Условный уровень пробок: <b>{jam_level}/10</b>\n📍 Улицы: <b>{', '.join(list(jam_streets)[:5])}</b>\n\n"
     else:
         text += f"📊 Уровень пробок: <b>Низкий</b>\n\n"
-    if is_bad_weather: text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
+    if is_bad_weather:
+        text += "⚠️ <i>Погода ухудшает ситуацию!</i>\n"
     text += "\n"
-    
+
     for news in filtered_news[:10]:
         body_text = news.get("full_text", news["title"])
         if body_text: body_text = body_text[0].upper() + body_text[1:]
         street = extract_street(body_text)
-        text += f"📝 <b>Событие:</b>\n{body_text}\n\n"
-        if street: text += f"📍 <b>Улица:</b> {street}.\n"
-        text += f"🏙 <b>Город:</b> {news['city']}.\n🕒 <b>Опубликовано:</b> {news['time']}\n🚦 <b>Влияние:</b> {news['impact_text']}\n➖➖➖➖➖➖➖➖\n\n"
+        header_icon = "🚓 <b>Угон / Розыск:</b>" if news.get("is_theft") else "📝 <b>Событие:</b>"
+
+        text += f"{header_icon}\n{body_text}\n\n"
+        text += f"🏙 <b>Город:</b> {news['city']}\n"
+        if news.get("district"):
+            text += f"🏘 <b>Район:</b> {news['district']}\n"
+        if street:
+            text += f"📍 <b>Улица:</b> {street}\n"
+        text += f"🕒 <b>Опубликовано:</b> {news['time']}\n🚦 <b>Статус:</b> {news['impact_text']}\n➖➖➖➖➖➖➖➖\n\n"
+
     return text
 
 async def calculate_and_send_route(user_id, start_point, end_point, send_func):
@@ -695,7 +846,7 @@ async def cmd_start(message: types.Message):
         "📌 <b>Что я умею:</b>\n"
         "🌤 <b>Погода</b> — прогноз, видимость, длительность осадков и состояние дорог.\n"
         "🌍 <b>Города</b> — погода в выбранных городах.\n"
-        "🚦 <b>ДТП и Заторы</b> — оперативные новости, балл пробок и улицы.\n"
+        "🚦 <b>ДТП, Заторы, Угоны</b> — оперативные новости, точный район, балл пробок и угоны.\n"
         "⛽ <b>Бензин</b> — цены и новости.\n"
         "🗺 <b>Маршрут</b> — расчет времени, камеры и погодные условия.\n\n"
         "⚙️ <b>Настройки:</b> Выбери города и настрой до 3-х времен для рассылки.\n\n"
@@ -719,7 +870,7 @@ async def cmd_fuel(message: types.Message):
     if news: text += f"\n\n{news}"
     await message.answer(text, parse_mode="HTML")
 
-@dp.message(F.text == "🚦 ДТП и Заторы")
+@dp.message(F.text == "🚦 ДТП, Заторы, Угоны")
 @dp.message(Command("traffic"))
 async def cmd_traffic(message: types.Message):
     uid = message.from_user.id

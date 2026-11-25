@@ -8,6 +8,7 @@ import hashlib
 import math
 import time
 import html
+import logging
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
@@ -358,7 +359,7 @@ class BroadcastState(StatesGroup):
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🌤 Погода"), KeyboardButton(text="🌍 Города")],
-        [KeyboardButton(text="🚦 Автодвижение и ЧП"), KeyboardButton(text="⛽ Бензин")],
+        [KeyboardButton(text="🚦 ДТП и Заторы"), KeyboardButton(text="⛽ Бензин")],
         [KeyboardButton(text="🗺 Маршрут"), KeyboardButton(text="🗂 Всё сразу")],
         [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="⏰ Время рассылки")]
     ], resize_keyboard=True)
@@ -600,7 +601,7 @@ def build_weather_block(risks: dict, news_list: list) -> str:
         st = extract_street(n["full_text"])
         if c and st: streets.setdefault(c, set()).add(st)
 
-    lines, calm, shown, any_bad = [], [], 0, False
+    cards, calm, shown, any_bad = [], [], 0, False
     for city, r in risks.items():
         up = r["upcoming"]
         if not (r["bad"] or up):
@@ -609,31 +610,28 @@ def build_weather_block(risks: dict, news_list: list) -> str:
             calm.append(city + " (есть риск)"); continue
         shown += 1
         any_bad = any_bad or r["bad"]
-        parts = []
-        if r["bad"]: parts.append(r["road"])
+        lines = [f"📍 <b>{city}</b> · {r['temp']:+.0f}°C"]
+        if r["bad"]: lines.append(r["road"])
         if up:
             kind = "снег" if up["snow"] else "осадки"
-            when = f"Сейчас и до {up['end']}" if up["start"] == "сейчас" else f"С {up['start']} до {up['end']}"
-            if up["tmin"] <= 1:
-                parts.append(f"{when} ожидаются {kind} при {up['tmin']:+.0f}°C: возможна гололедица, дорога станет скользкой.")
-            else:
-                parts.append(f"{when} ожидаются {kind}: асфальт будет мокрым, тормозной путь больше.")
-        block = f"📍 <b>{city}</b> ({r['temp']:+.0f}°C): " + " ".join(parts)
+            when = f"сейчас и до {up['end']}" if up["start"] == "сейчас" else f"с {up['start']} до {up['end']}"
+            tail = ", будет скользко" if up["tmin"] <= 1 else ", асфальт будет мокрым"
+            lines.append(f"🕗 {when.capitalize()}: {kind} при {up['tmin']:+.0f}°C{tail}")
         if city == "Иваново":
-            spots = ", ".join(c["name"] for c in CAMERAS[:4])
-            block += f"\n   ⚠️ В такую погоду осторожнее на мостах и загруженных узлах: {esc(spots)}."
+            spots = ", ".join(c["name"] for c in CAMERAS[:3])
+            lines.append(f"⚠️ Осторожнее: {esc(spots)}")
         else:
-            block += "\n   ⚠️ Осторожнее на мостах, спусках, подъёмах и выездах на трассу."
+            lines.append("⚠️ Осторожнее на мостах, спусках и выездах на трассу")
         if streets.get(city):
-            block += f"\n   📰 По новостям уже были происшествия: {esc(', '.join(sorted(streets[city])[:4]))}."
-        lines.append(block)
+            lines.append(f"📰 В новостях: {esc(', '.join('ул. ' + x for x in sorted(streets[city])[:3]))}")
+        cards.append("\n".join(lines))
 
-    if not lines: return ""
-    text = "🌦 <b>Погода и дороги (ваши города):</b>\n" + "\n\n".join(lines)
+    if not cards: return ""
+    text = "🌦 <b>Погода и дороги в ваших городах</b>\n\n" + "\n\n".join(cards)
     if any_bad:
-        text += f"\n\n⏱ В часы пик ({RUSH_HOURS}) при такой погоде заторы вероятнее."
+        text += f"\n\n⏱ В часы пик ({RUSH_HOURS}) заторы вероятнее."
     if calm:
-        text += f"\n\n✅ Без осложнений: {', '.join(calm)}"
+        text += f"\n✅ Без осложнений: {', '.join(calm)}"
     text += "\n<i>Оценка по прогнозу погоды и новостям, не данные дорожных служб.</i>"
     return text
 
@@ -810,12 +808,12 @@ def traffic_window(text, ev_type, dt=None, is_high=False):
 
     if not start or not end or end <= start: return ""
     s, e = start.strftime("%H:%M"), end.strftime("%H:%M")
-    if end < now: status = "по описанию, уже должно было разъехаться"
+    if end < now: status = "по описанию, уже закончилось"
     elif start > now: status = "ещё впереди"
     else: status = "возможно, идёт сейчас"
     if planned or ev_type == "roadwork":
-        return f"⏱ <b>Время ограничений:</b> {s}–{e} ({status})"
-    return f"⏱ <b>Возможны затруднения:</b> примерно {s}–{e} ({status})"
+        return f"⏱ Ограничения: <b>{s}–{e}</b> · {status}"
+    return f"⏱ Затруднения: <b>~{s}–{e}</b> · {status}"
 
 # =====================================================================
 #                    ТОЧНОЕ ОПРЕДЕЛЕНИЕ МЕСТА СОБЫТИЯ
@@ -922,33 +920,74 @@ def classify_event_and_impact(text, city=None, district=None, highway=None):
     off_city = bool(highway or (district and not city))
 
     if re.search(THEFT_PATTERN, lower):
-        return ("🚓 <b>Угон / Розыск транспорта:</b>",
-                "🚓 <b>Внимание:</b> Угон / Розыск авто. Проверяйте дворы и камеры!", False, "theft")
+        return "🚓 <b>Угон / розыск авто</b>", "🚓 Внимание", False, "theft"
 
     if re.search(PEDESTRIAN_PATTERN, lower):
-        return ("🚶‍♂️ <b>Наезд на пешехода:</b>",
-                "🔴 <b>Критично!</b> Наезд на пешехода. Работают экстренные службы, движение затруднено.", True, "pedestrian")
+        return "🚶 <b>Наезд на пешехода</b>", "🔴 Критично", True, "pedestrian"
 
     if re.search(ROADWORK_PATTERN, lower):
-        return ("🚧 <b>Перекрытие / Ограничение движения:</b>",
-                "🟠 <b>Внимание:</b> Участок перекрыт или идут дорожные работы. Ищите пути объезда!", True, "roadwork")
+        return "🚧 <b>Перекрытие / ограничение движения</b>", "🟠 Ищите объезд", True, "roadwork"
 
     high_words = ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет", "коллапс", "пострадал", "пьян", "встречк", "реанимац", "госпитализ"]
     if any(w in lower for w in high_words):
-        impact = ("🔴 <b>Высокое.</b> На этом направлении возможны серьёзные проблемы и заторы!" if off_city
-                  else "🔴 <b>Высокое.</b> Серьёзная авария, возможна пробка.")
-        return "💥 <b>Серьёзное ДТП:</b>", impact, True, "accident"
+        impact = "🔴 Высокое: возможны заторы на направлении" if off_city else "🔴 Высокое: возможна пробка"
+        return "💥 <b>Серьёзное ДТП</b>", impact, True, "accident"
 
     if any(w in lower for w in ["дтп", "авари", "столкн", "скорая", "затор", "пробка", "скопление", "затруднен"]):
-        impact = ("🟠 <b>Среднее.</b> На этом участке возможны затруднения движения." if off_city
-                  else "🟠 <b>Среднее.</b> Замедление движения.")
-        return "🚗 <b>ДТП / Затор:</b>", impact, False, "traffic"
+        impact = "🟠 Среднее: возможны затруднения на участке" if off_city else "🟠 Среднее: возможно замедление"
+        return "🚗 <b>ДТП / затор</b>", impact, False, "traffic"
 
     if re.search(WEATHER_ROAD_PATTERN, lower):
-        return ("🧊 <b>Опасные дорожные условия:</b>",
-                "🟠 <b>Внимание:</b> Скользкая дорога, снизьте скорость и увеличьте дистанцию.", False, "weather_road")
+        return "🧊 <b>Опасные дорожные условия</b>", "🟠 Снизьте скорость", False, "weather_road"
 
-    return "📝 <b>Дорожная информация:</b>", "🟢 <b>Низкое.</b> Примите к сведению.", False, "info"
+    return "📝 <b>Дорожная информация</b>", "🟢 Низкое", False, "info"
+
+def short_text(text, limit=260):
+    """Сокращает длинный текст до 1-3 предложений."""
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'#\w+', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    sentences = re.split(r'(?<=[.!?])(?<!\bул\.)(?<!\bпр\.)(?<!\bг\.)(?<!\bд\.)(?<!\bкм\.)(?<!\bпер\.)\s+(?=[А-ЯЁ«"])', text)
+    out = ""
+    for sent in sentences:
+        if not out:
+            out = sent
+        elif len(out) + 1 + len(sent) <= limit:
+            out += " " + sent
+        else:
+            break
+    if len(out) > limit + 60:
+        out = out[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    elif len(out) < len(text):
+        out = out.rstrip() + " …"
+    return out
+
+def place_line(n) -> str:
+    parts = []
+    if n.get("city"): parts.append(n["city"])
+    if n.get("district"): parts.append(n["district"])
+    if n.get("settlement"): parts.append(n["settlement"])
+    street = extract_street(n["full_text"])
+    if street: parts.append(f"ул. {street}")
+    if not parts:
+        return "📍 Место не указано (Ивановская область)"
+    if not n.get("city"):
+        parts.append("Ивановская обл.")
+    return "📍 " + " · ".join(esc(p) for p in parts)
+
+def format_event(n) -> str:
+    lines = [n["header"], place_line(n)]
+    if n.get("highway"): lines.append(f"🛣 {esc(n['highway'])}")
+    lines.append(f"<blockquote>{esc(short_text(n['full_text']))}</blockquote>")
+    window = traffic_window(n["full_text"], n["ev_type"], n.get("dt"), n["is_high"])
+    if window: lines.append(window)
+    foot = [n["impact_text"], f"🕒 {n['time']}"]
+    if n.get("link"):
+        foot.append(f'<a href="{html.escape(n["link"], quote=True)}">{esc(n["source"])}</a>')
+    elif n.get("source"):
+        foot.append(esc(n["source"]))
+    lines.append(" · ".join(foot))
+    return "\n".join(lines)
 
 # =====================================================================
 #                     ПОИСК НОВОСТЕЙ: САЙТЫ, КАНАЛЫ, ПАБЛИКИ, ЧАТЫ
@@ -981,12 +1020,18 @@ def build_event(text, dt=None, link=None, source="", time_label=None, hint_city=
         "time": time_label or format_time(dt), "link": link, "source": source, **loc,
     }
 
+# Объявления, графики уборки, конкурсы и т.п. - это не события на дорогах
+NOISE_PATTERN = r'(оставить\s+заявк|принима\w+\s+обращен|единой\s+дежурн|график\w*\s+уборк|уборк\w*\s+снега|очищ\w+\s+от\s+снега|песко-?солев|розыгрыш|конкурс|скидк|вакансии|акци[яи]\b)'
+STRONG_PATTERN = r'\b(дтп|авари\w*|столкн\w*|сбил\w*|пострадал\w*|погиб\w*|угон\w*|угнал\w*|опрокин\w*|перевернул\w*|затор\w*|пробк\w*|перекрыт\w*|перекро\w*)\b'
+
 def event_from_raw(raw, source, local=False, hint_city=None):
     text = raw.get("text") or ""
     if not text: return None
     if not event_date_ok(text): return None
     lower = text.lower()
-    if not is_auto_related(lower): return None
+    lead = lower[:400]  # суть события должна быть в начале текста, а не где-то в середине длинной статьи
+    if not is_auto_related(lead): return None
+    if re.search(NOISE_PATTERN, lower) and not re.search(STRONG_PATTERN, lead): return None
     if not (local or is_region_related(lower)): return None
     if any(re.search(rf'\b{sw}\b', lower) for sw in STOP_WORDS): return None
     return build_event(text, dt=raw.get("dt"), link=raw.get("link"), source=source,
@@ -1180,8 +1225,6 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
                     if is_high or "затор" in news["full_text"].lower() or "пробка" in news["full_text"].lower():
                         street = extract_street(news["full_text"])
                         if street: jam_streets.add(street)
-                if mark_seen:
-                    mark_news_as_seen(user_id, news_hash)
 
     # Погода по выбранным городам + выводы по новостям
     risks = await get_cities_weather_risk(user_cities)
@@ -1191,41 +1234,34 @@ async def get_traffic_summary(user_id, is_bad_weather, user_cities, mark_seen=Tr
     if not filtered_news and not weather_block:
         return "✅ <b>Новых сообщений об автодвижении и ЧП нет (за последние 2 дня), погода без осложнений.</b>"
 
-    text = ""
+    DIV = "━━━━━━━━━━━━━━"
+    MAX_EVENTS = 10
+    parts = []
     if filtered_news:
+        shown_news = filtered_news[:MAX_EVENTS]
+        if mark_seen:  # «прочитанными» помечаем только то, что реально показано
+            for news in shown_news:
+                mark_news_as_seen(user_id, generate_hash(news["full_text"]))
         jam_level = min(10, 2 + traffic_events_count * 2) if traffic_events_count > 0 else 1
         if weather_bad: jam_level = min(10, jam_level + 2)
-        text += "🚨 <b>Автодвижение и происшествия (Ивановская область):</b>\n"
-        if jam_streets:
-            text += f"📊 Условный уровень пробок: <b>{jam_level}/10</b>\n📍 Проблемные улицы: <b>{esc(', '.join(list(jam_streets)[:5]))}</b>\n\n"
-        else:
-            text += f"📊 Уровень пробок: <b>{jam_level}/10</b>\n\n"
-        text += "<i>Время затруднений оценено по описанию события, это не данные навигаторов.</i>\n\n"
-
-        for news in filtered_news[:15]:
-            body_text = news.get("full_text", news["title"])
-            if body_text: body_text = body_text[0].upper() + body_text[1:]
-            street = extract_street(body_text)
-
-            text += f"{news['header']}\n{esc(body_text)}\n\n"
-            text += location_lines(news)
-            if news.get("highway"): text += f"🛣 <b>Трасса / направление:</b> {esc(news['highway'])}\n"
-            if street: text += f"📍 <b>Улица:</b> {esc(street)}\n"
-            text += f"🕒 <b>Опубликовано:</b> {news['time']}\n"
-            window = traffic_window(news["full_text"], news["ev_type"], news.get("dt"), news["is_high"])
-            if window: text += window + "\n"
-            text += f"🚦 <b>Обстановка:</b> {news['impact_text']}\n"
-            if news.get("link"):
-                text += f"🔗 <a href=\"{html.escape(news['link'], quote=True)}\">{esc(news['source'])}</a>\n"
-            elif news.get("source"):
-                text += f"📡 Источник: {esc(news['source'])}\n"
-            text += "➖➖➖➖➖➖➖➖\n\n"
+        bar = "▰" * jam_level + "▱" * (10 - jam_level)
+        head = (f"🚨 <b>ДОРОЖНАЯ ОБСТАНОВКА</b> · {datetime.now(MSK_TZ).strftime('%H:%M')}\n"
+                f"📊 Пробки: <b>{jam_level}/10</b> {bar}")
+        if weather_bad: head += "\n🌧 Погода осложняет движение"
+        if jam_streets: head += f"\n📍 Проблемные улицы: {esc(', '.join(list(jam_streets)[:5]))}"
+        head += "\n<i>Время затруднений оценено по описанию события, это не данные навигаторов.</i>"
+        parts.append(head)
+        for news in shown_news:
+            parts.append(format_event(news))
+        if len(filtered_news) > MAX_EVENTS:
+            parts.append(f"…и ещё {len(filtered_news) - MAX_EVENTS} сообщ. Они придут в следующий раз.")
     else:
-        text += "✅ <b>Новых сообщений о ДТП и ЧП нет.</b>\n\n"
+        parts.append("✅ <b>Новых происшествий нет.</b>")
 
     if weather_block:
-        text += weather_block
-    return text
+        parts.append(DIV)
+        parts.append(weather_block)
+    return "\n\n".join(parts)
 
 # =====================================================================
 #                              МАРШРУТЫ
@@ -1483,7 +1519,7 @@ async def cmd_start(message: types.Message):
         "📌 <b>Что я умею:</b>\n"
         "🌤 <b>Погода</b> — прогноз, видимость, длительность осадков и состояние дорог.\n"
         "🌍 <b>Города</b> — погода в выбранных городах.\n"
-        "🚦 <b>Автодвижение и ЧП</b> — ДТП, наезды на пешеходов, перекрытия, пробки, угоны, точный район или трасса, время возможных затруднений и риски из-за погоды в твоих городах.\n"
+        "🚦 <b>ДТП и Заторы</b> — короткие карточки: что случилось, где (город, район, трасса), когда возможны затруднения и чем грозит погода в твоих городах.\n"
         "⛽ <b>Бензин</b> — цены и новости.\n"
         "🗺 <b>Маршрут</b> — расчет времени, камеры и погодные условия.\n\n"
         "⚙️ <b>Настройки:</b> Выбери города и настрой до 3-х времен для рассылки.\n\n"
@@ -1507,11 +1543,18 @@ async def cmd_fuel(message: types.Message):
     if news: text += f"\n\n{news}"
     await answer_long(message.answer, text)
 
-@dp.message(F.text == "🚦 Автодвижение и ЧП")
+@dp.message(F.text.in_({"🚦 ДТП и Заторы", "🚦 Автодвижение и ЧП"}))
 @dp.message(Command("traffic"))
 async def cmd_traffic(message: types.Message):
     uid = message.from_user.id
-    text = await get_traffic_summary(uid, (await get_weather_ivanovo())[1], get_user_cities(uid))
+    wait = await message.answer("⏳ Собираю свежие сообщения...")
+    try:
+        text = await get_traffic_summary(uid, (await get_weather_ivanovo())[1], get_user_cities(uid))
+    except Exception as e:
+        logging.exception("traffic summary failed")
+        text = f"⚠️ Не удалось собрать сводку: {esc(str(e)[:150])}"
+    try: await wait.delete()
+    except Exception: pass
     await answer_long(message.answer, text)
 
 @dp.message(F.text == "🗂 Всё сразу")
@@ -1524,7 +1567,11 @@ async def cmd_all(message: types.Message):
     text = (f"{weather_text}\n\n{await get_region_weather(get_user_cities(user_id))}\n\n{await get_fuel_prices(True)}\n\n")
     if fuel_news: text += f"{fuel_news}\n"
     if weather_news: text += f"{weather_news}\n"
-    text += f"{await get_traffic_summary(user_id, is_bad, get_user_cities(user_id))}"
+    try:
+        text += f"{await get_traffic_summary(user_id, is_bad, get_user_cities(user_id))}"
+    except Exception as e:
+        logging.exception("traffic summary failed")
+        text += f"⚠️ Дорожную сводку собрать не удалось: {esc(str(e)[:150])}"
     await answer_long(message.answer, text)
 
 @dp.message(F.text == "⚙️ Настройки")
@@ -1652,7 +1699,12 @@ async def collect_chat_message(message: types.Message):
     save_chat_event(text, message.chat.title or "чат")
     _events_cache["ts"] = 0.0
 
+@dp.message(F.chat.type == "private")
+async def fallback_private(message: types.Message):
+    await message.answer("Выберите действие кнопкой меню внизу 👇", reply_markup=get_main_menu())
+
 async def main():
+    logging.basicConfig(level=logging.INFO)
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
     scheduler.add_job(broadcast_job, trigger='cron', minute='*')
     scheduler.start()

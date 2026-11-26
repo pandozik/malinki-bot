@@ -8,6 +8,7 @@ import hashlib
 import math
 import time
 import html
+import difflib
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
@@ -169,31 +170,30 @@ TOWNS = {
     "Ильинское-Хованское": (r'\bильинск(?:ое|ом|ого)[- ]хованск\w+', "Ильинский район"),
 }
 
-CITY_DISTRICTS = {
-    "Ленинский район": r'ленинск(?:ом|ого|ий|ому|им)\s+район', "Октябрьский район": r'октябрьск(?:ом|ого|ий|ому|им)\s+район',
-    "Советский район": r'советск(?:ом|ого|ий|ому|им)\s+район', "Фрунзенский район": r'фрунзенск(?:ом|ого|ий|ому|им)\s+район',
-    "мкр. Авдотьино": r'авдотьин[оеа]', "мкр. Сортировка": r'сортировк[аеу]',
-    "мкр. Московский": r'московск(?:ий|ом)\s+микрорайон', "мкр. Суховка": r'суховк[аеу]',
-}
-
+# Расширенные паттерны для поиска ДТП
 THEFT_PATTERN = r'\b(угон\w*|угнал\w*|похищ\w*\s+(?:авто|машин|транспорт|ваз|лада|иномарк)|похитил\w*\s+(?:авто|машин|транспорт)|розыск\w*\s+(?:авто|машин|транспорт)|краж\w*\s+(?:авто|машин))\b'
 PEDESTRIAN_PATTERN = r'\b(сбил\w*\s+(?:пешеход|человек|мужчин|женщин|ребенк|девочк|мальчик|пенсионер|подростк)|наезд\w*\s+на\s+пешеход|пешеход\w*\s+(?:попал|оказался)\s+под\s+колес)\b'
 ROADWORK_PATTERN = r'\b(перекрыт\w*|перекро\w*|перекрыва\w*|ограничен\w*\s+движен|ремонт\w*\s+дорог|закрыт\w*\s+движен|объезд\w*|светофор\w*\s+не\s+работа|отключ\w*\s+светофор|ямочн\w*\s+ремонт|реверсивн\w*\s+движен)\b'
-TRAFFIC_PATTERN = r'\b(дтп|авари\w*|пробк\w*|затор\w*|столкн\w*|пострадал\w*|скоплен\w*|затруднен\w*|стоит\s+движен|вылет\w*\s+(?:в\s+кювет|с\s+дороги|на\s+встречк)|опрокид\w*|перевернул\w*|лобов\w*|врезал\w*|снес\w*\s+(?:столб|остановк|огражден)|фура\s+(?:перегородил|развернул|застрял)|эвакуатор|паралич\w*\s+движени)\b'
+TRAFFIC_PATTERN = r'\b(дтп|авария|аварии|аварий|пробка|пробки|затор|столкновение|пострадал|скопление|затруднено|вылет|опрокидывание|перевертыш|лобовое|врезался|протаранил|снесло|фура|эвакуатор|парализовало|наезд|сбил)\b'
 WEATHER_ROAD_PATTERN = r'\b(гололед\w*|гололёд\w*|скользк\w+\s+дорог\w*|снежн\w+\s+накат\w*|наледь\w*)\b'
 
-STOP_WORDS = ["украин", "москв", "петербург", "росси", "сша", "европ", "пробаци", "проблем"]
+STOP_WORDS = ["украин", "москв", "петербург", "росси", "сша", "европ", "пробаци", "проблем", "политика", "спецоперац"]
 
 RSS_SOURCES = [
     "https://newsivanovo.ru/rss", "https://ivanovonews.ru/rss/", "https://mkivanovo.ru/rss/",
     "https://iv-news.ru/feed/", "https://37.ru/rss/", "https://cursiv.ru/rss/",
     "https://kineshemec.ru/rss/", "https://mspros.ru/rss/",
 ]
+# Расширенный список TG каналов
 TG_CHANNELS = [
     "ivanovonewsBars", "ivanovo_proisshestvia", "chp_ivanovo", "dtp_ivanovo",
     "typical_kineshma", "kineshemec_ru", "shuya_news", "vichuga_news",
-    "gibdd37", "ivoblast", "ivanovo_news", "ivanovo_tipichny"
+    "gibdd37", "ivoblast", "ivanovo_news", "ivanovo_tipichny", "ivanovo_life", 
+    "ivanovo_chp", "dtp37", "avtopartner_ivanovo"
 ]
+# Эти каналы считаются локальными, бот не требует явного упоминания "Иваново"
+LOCAL_TG = ["ivanovonewsBars", "ivanovo_proisshestvia", "chp_ivanovo", "dtp_ivanovo", "gibdd37", "ivoblast", "ivanovo_news", "ivanovo_life", "ivanovo_chp", "dtp37", "avtopartner_ivanovo"]
+
 VK_GROUPS = [
     "https://m.vk.ru/avtopartner_ivanovo", "https://m.vk.ru/chp_ivanovo",
     "https://m.vk.ru/dtp_ivanovo", "https://m.vk.ru/ivanovonews",
@@ -480,13 +480,33 @@ def classify_event_and_impact(text, city=None):
     if re.search(PEDESTRIAN_PATTERN, lower): return ("🚶‍♂️ <b>Наезд на пешехода:</b>", "🔴 <b>Критично!</b> Наезд на пешехода.", True)
     if re.search(ROADWORK_PATTERN, lower): return ("🚧 <b>Перекрытие:</b>", "🟡 <b>Внимание:</b> Дорожные работы.", True)
 
-    high_words = ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет", "коллапс", "пострадал", "пьян", "встречк", "сбил"]
+    high_words = ["перекрыт", "смертельн", "погиб", "фура", "грузовик", "трасса", "тройное", "массов", "вылет", "коллапс", "пострадал", "пьян", "встречк", "сбил", "скорая"]
     if any(w in lower for w in high_words): return "💥 <b>Серьезное ДТП:</b>", "🔴 <b>Высокое.</b> Возможна пробка.", True
 
-    if any(w in lower for w in ["дтп", "авари", "столкн", "скорая", "затор", "пробка", "скопление"]):
+    if any(w in lower for w in ["дтп", "авари", "столкн", "затор", "пробка", "скопление", "наезд"]):
         return "🚗 <b>ДТП / Затор:</b>", "🟠 <b>Среднее.</b> Замедление.", False
 
     return "📝 <b>Дорожная информация:</b>", "🟢 <b>Низкое.</b> Примите к сведению.", False
+
+def get_news_core(text):
+    """Создает уникальный отпечаток события (город + улица + тип события)"""
+    lower = text.lower()
+    loc = extract_location(lower)
+    street = extract_street(lower)
+    header = classify_event_and_impact(lower)[0]
+    
+    core = []
+    if loc["city"]: core.append(loc["city"])
+    if loc["district"]: core.append(loc["district"])
+    if street: core.append(street)
+    core.append(header)
+    
+    # Если не удалось вытащить улицу/город, берем первые 5 значимых слов
+    if len(core) < 2:
+        words = re.findall(r'\b[а-яА-ЯёЁ]{5,}\b', lower)
+        core.extend(words[:5])
+        
+    return generate_hash("_".join(core))
 
 # =====================================================================
 #                     ПАРСИНГ НОВОСТЕЙ
@@ -538,7 +558,7 @@ async def fetch_tg(session, channel):
         text = clean_telegram_text("\n".join(d.get_text(separator="\n", strip=True) for d in divs))
         if event_date_ok(text):
             lower = text.lower()
-            local = channel in ["ivanovonewsBars", "ivanovo_proisshestvia", "chp_ivanovo", "dtp_ivanovo"]
+            local = channel in LOCAL_TG
             if is_auto_related(lower) and (local or is_region_related(lower)) and not any(sw in lower for sw in STOP_WORDS):
                 loc = extract_location(text)
                 items.append({"full_text": text, "dt": dt, "time": format_time(dt), "source": f"t.me/{channel}", **loc})
@@ -560,6 +580,18 @@ async def fetch_vk(session, group_url):
 # =====================================================================
 #                           СВОДКА ПО ДОРОГАМ
 # =====================================================================
+def is_duplicate_text(text1, text2, threshold=0.65):
+    """Умная проверка на дубли с использованием SequenceMatcher"""
+    t1 = re.sub(r'[^\w\s]', '', text1.lower())
+    t2 = re.sub(r'[^\w\s]', '', text2.lower())
+    
+    # Быстрая проверка на точное совпадение или полное вхождение
+    if t1 in t2 or t2 in t1: return True
+    
+    # Сравнение схожести текста
+    seq = difflib.SequenceMatcher(None, t1, t2)
+    return seq.ratio() > threshold
+
 async def get_traffic_summary(user_id, user_cities, mark_seen=True):
     cleanup_old_news()
     all_news = []
@@ -577,14 +609,14 @@ async def get_traffic_summary(user_id, user_cities, mark_seen=True):
     if not all_news: 
         return "✅ <b>Свежих сообщений о ДТП нет (за сегодня и вчера).</b>"
         
+    # 1. Дедупликация внутри пачки (Fuzzy)
     unique_news = []
     for news in all_news:
-        words_new = set(w.strip(".,!?\"'()-").lower() for w in news["full_text"].split() if len(w) > 4)
         is_dup = False
         for ex in unique_news:
-            words_ex = set(w.strip(".,!?\"'()-").lower() for w in ex["full_text"].split() if len(w) > 4)
-            if len(words_new.intersection(words_ex)) >= 3:
-                is_dup = True; break
+            if is_duplicate_text(news["full_text"], ex["full_text"], threshold=0.65):
+                is_dup = True
+                break
         if not is_dup: unique_news.append(news)
             
     filtered_news = []
@@ -604,13 +636,15 @@ async def get_traffic_summary(user_id, user_cities, mark_seen=True):
         elif "Иваново" in user_cities and f_city == "Ивановская область": show = True
             
         if show:
-            news_hash = generate_hash(news["full_text"])
-            if not is_news_seen(user_id, news_hash):
+            # Используем "ядро" новости для проверки в БД
+            news_core_hash = get_news_core(news["full_text"])
+            
+            if not is_news_seen(user_id, news_core_hash):
                 filtered_news.append(news)
                 if is_high or "затор" in news["full_text"].lower() or "пробка" in news["full_text"].lower():
                     street = extract_street(news["full_text"])
                     if street: jam_streets.add(street)
-                if mark_seen: mark_news_as_seen(user_id, news_hash)
+                if mark_seen: mark_news_as_seen(user_id, news_core_hash)
             
     if not filtered_news: return "✅ <b>Свежих сообщений о ДТП в выбранных городах нет (все прочитаны).</b>"
     
@@ -620,7 +654,7 @@ async def get_traffic_summary(user_id, user_cities, mark_seen=True):
     else:
         text += f"📊 Уровень пробок: <b>Свободно</b>\n\n"
     
-    for news in filtered_news[:10]:
+    for news in filtered_news[:15]: # Увеличили до 15 новостей
         body_text = news["full_text"]
         if body_text: body_text = body_text[0].upper() + body_text[1:]
         street = extract_street(body_text)

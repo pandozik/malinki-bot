@@ -94,6 +94,10 @@ def save_new_route(user_id: int, name: str, start: str, end: str):
 
 def generate_hash(text): return hashlib.md5(text.encode('utf-8')).hexdigest()
 
+def slug(text: str) -> str:
+    """Безопасный кусок callback_data: без пробелов, до 24 символов."""
+    return re.sub(r'\s+', '_', text.strip())[:24]
+
 def is_news_seen(user_id, news_hash):
     conn = sqlite3.connect("users.db"); cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM seen_news WHERE user_id = ? AND news_hash = ?", (user_id, news_hash))
@@ -294,7 +298,7 @@ async def get_weather_ivanovo():
     precip_now = _num(current.get("precipitation"))
 
     precip_list = hourly.get("precipitation", [])
-    duration_text = ""
+    duration_text = ""  # ИСПРАВЛЕНИЕ 1: создаётся всегда, а не только внутри if precip_now > 0
     if precip_now > 0:
         hours_left = 0
         for i in range(24, len(precip_list)):
@@ -330,8 +334,12 @@ async def get_region_weather(user_cities: list):
                 lines = []
                 for i, city in enumerate(selected_cities.keys()):
                     if i < len(data):
-                        current = data[i].get("current", {})
-                        lines.append(f"{get_weather_emoji(current.get('weather_code', 0))} <b>{city}</b>: {current.get('temperature_2m', 0):+.1f}°C, 💧{current.get('precipitation_probability', 0)}%")
+                        # ИСПРАВЛЕНИЕ 2: current может быть массивом (2+ города) или объектом (1 город)
+                        cur = data[i].get("current")
+                        if isinstance(cur, list):
+                            cur = cur[i] if i < len(cur) else {}
+                        cur = cur or {}
+                        lines.append(f"{get_weather_emoji(cur.get('weather_code', 0))} <b>{city}</b>: {cur.get('temperature_2m', 0):+.1f}°C, 💧{cur.get('precipitation_probability', 0)}%")
                 return "🌍 <b>Погода в выбранных городах:</b>\n" + "\n".join(lines)
         except Exception: return "⚠️ Ошибка при запросе к сервису."
 
@@ -376,11 +384,13 @@ async def get_fuel_prices(show_delta=False):
                         text += format_price_with_delta("ДТ", prices.get("ДТ"), yesterday.get("ДТ"))
                     else:
                         text += f"🔹 <b>АИ-92:</b> {prices.get('АИ-92', '—')} ₽/л\n🔹 <b>АИ-95:</b> {prices.get('АИ-95', '—')} ₽/л\n🔹 <b>ДТ:</b> {prices.get('ДТ', '—')} ₽/л\n"
-                    save_today_fuel(prices.get("АИ-92"), prices.get("АИ-95"), prices.get("ДТ"))
                 else:
                     if "АИ-92" in prices: text += f"🔹 <b>АИ-92:</b> {prices['АИ-92']:.2f} ₽/л\n"
                     if "АИ-95" in prices: text += f"🔹 <b>АИ-95:</b> {prices['АИ-95']:.2f} ₽/л\n"
                     if "ДТ" in prices: text += f"🔹 <b>ДТ:</b> {prices['ДТ']:.2f} ₽/л\n"
+
+                # ИСПРАВЛЕНИЕ 3: история пишется в ОБЕИХ ветках (раньше — только при show_delta=True)
+                save_today_fuel(prices.get("АИ-92"), prices.get("АИ-95"), prices.get("ДТ"))
                 return text
     except Exception: return "⚠️ Ошибка сети при запросе цен."
 
@@ -733,7 +743,8 @@ async def calculate_and_send_route(user_id, start_point, end_point, send_func):
         f"🚦 <b>Трафик:</b> {'Есть ДТП, возможны задержки (+10 мин)' if time_penalty else 'Свободно'}\n"
         f"{camera_warning}"
     )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data=f"save_route_{start_point[:10]}_{end_point[:10]}")]])
+    # ИСПРАВЛЕНИЕ 4: слаг вместо сырых адресов в callback_data (пробелы/запятые ломали кнопку)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data=f"save_route_{slug(start_point)}_{slug(end_point)}")]])
     await wait_msg.edit_text(result_text, parse_mode="HTML", reply_markup=keyboard)
 
 # =====================================================================
@@ -779,7 +790,7 @@ def get_cities_keyboard(user_cities: list):
     keyboard = [[InlineKeyboardButton(text="✅ Выбрать ВСЕ", callback_data="select_all"), InlineKeyboardButton(text="❌ Очистить", callback_data="clear_all")]]
     row = []
     for city in REGION_CITIES.keys():
-        row.append(InlineKeyboardButton(text=f"✅ {city}" if city in user_cities else city, callback_data=f"toggle_{city}"))
+        row.append(InlineKeyboardButton(text=f"✅ {city}" if city in user_cities else city, callback_data=f"toggle_{slug(city)}"))
         if len(row) == 2: keyboard.append(row); row = []
     if row: keyboard.append(row)
     keyboard.append([InlineKeyboardButton(text="💾 Сохранить и выйти", callback_data="save_settings")])
@@ -942,7 +953,8 @@ async def process_clear_all(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("toggle_"))
 async def process_toggle_city(callback: CallbackQuery):
-    city = callback.data.split("_")[1]
+    # ИСПРАВЛЕНИЕ 4: город целиком после префикса, а не split("_")[1] (иначе «Посад» терялся)
+    city = callback.data[7:].replace("_", " ")
     user_cities = get_user_cities(callback.from_user.id)
     if city in user_cities: user_cities.remove(city)
     else: user_cities.append(city)

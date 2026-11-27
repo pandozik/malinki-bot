@@ -95,7 +95,6 @@ def save_new_route(user_id: int, name: str, start: str, end: str):
 def generate_hash(text): return hashlib.md5(text.encode('utf-8')).hexdigest()
 
 def slug(text: str) -> str:
-    """Безопасный кусок callback_data: без пробелов, до 24 символов."""
     return re.sub(r'\s+', '_', text.strip())[:24]
 
 def is_news_seen(user_id, news_hash):
@@ -110,6 +109,7 @@ def mark_news_as_seen(user_id, news_hash):
     conn.commit(); conn.close()
 
 def cleanup_old_news():
+    """Вызывается раз в сутки по крону, чтобы не нагружать БД"""
     cutoff = (datetime.now(MSK_TZ) - timedelta(days=3)).strftime("%Y-%m-%d")
     conn = sqlite3.connect("users.db"); cursor = conn.cursor()
     cursor.execute("DELETE FROM seen_news WHERE seen_date < ?", (cutoff,))
@@ -174,7 +174,6 @@ TOWNS = {
     "Ильинское-Хованское": (r'\bильинск(?:ое|ом|ого)[- ]хованск\w+', "Ильинский район"),
 }
 
-# Расширенные паттерны для поиска ДТП
 THEFT_PATTERN = r'\b(угон\w*|угнал\w*|похищ\w*\s+(?:авто|машин|транспорт|ваз|лада|иномарк)|похитил\w*\s+(?:авто|машин|транспорт)|розыск\w*\s+(?:авто|машин|транспорт)|краж\w*\s+(?:авто|машин))\b'
 PEDESTRIAN_PATTERN = r'\b(сбил\w*\s+(?:пешеход|человек|мужчин|женщин|ребенк|девочк|мальчик|пенсионер|подростк)|наезд\w*\s+на\s+пешеход|пешеход\w*\s+(?:попал|оказался)\s+под\s+колес)\b'
 ROADWORK_PATTERN = r'\b(перекрыт\w*|перекро\w*|перекрыва\w*|ограничен\w*\s+движен|ремонт\w*\s+дорог|закрыт\w*\s+движен|объезд\w*|светофор\w*\s+не\s+работа|отключ\w*\s+светофор|ямочн\w*\s+ремонт|реверсивн\w*\s+движен)\b'
@@ -188,14 +187,12 @@ RSS_SOURCES = [
     "https://iv-news.ru/feed/", "https://37.ru/rss/", "https://cursiv.ru/rss/",
     "https://kineshemec.ru/rss/", "https://mspros.ru/rss/",
 ]
-# Расширенный список TG каналов
 TG_CHANNELS = [
     "ivanovonewsBars", "ivanovo_proisshestvia", "chp_ivanovo", "dtp_ivanovo",
     "typical_kineshma", "kineshemec_ru", "shuya_news", "vichuga_news",
     "gibdd37", "ivoblast", "ivanovo_news", "ivanovo_tipichny", "ivanovo_life", 
     "ivanovo_chp", "dtp37", "avtopartner_ivanovo"
 ]
-# Эти каналы считаются локальными, бот не требует явного упоминания "Иваново"
 LOCAL_TG = ["ivanovonewsBars", "ivanovo_proisshestvia", "chp_ivanovo", "dtp_ivanovo", "gibdd37", "ivoblast", "ivanovo_news", "ivanovo_life", "ivanovo_chp", "dtp37", "avtopartner_ivanovo"]
 
 VK_GROUPS = [
@@ -298,7 +295,7 @@ async def get_weather_ivanovo():
     precip_now = _num(current.get("precipitation"))
 
     precip_list = hourly.get("precipitation", [])
-    duration_text = ""  # ИСПРАВЛЕНИЕ 1: создаётся всегда, а не только внутри if precip_now > 0
+    duration_text = "" 
     if precip_now > 0:
         hours_left = 0
         for i in range(24, len(precip_list)):
@@ -334,7 +331,6 @@ async def get_region_weather(user_cities: list):
                 lines = []
                 for i, city in enumerate(selected_cities.keys()):
                     if i < len(data):
-                        # ИСПРАВЛЕНИЕ 2: current может быть массивом (2+ города) или объектом (1 город)
                         cur = data[i].get("current")
                         if isinstance(cur, list):
                             cur = cur[i] if i < len(cur) else {}
@@ -389,7 +385,6 @@ async def get_fuel_prices(show_delta=False):
                     if "АИ-95" in prices: text += f"🔹 <b>АИ-95:</b> {prices['АИ-95']:.2f} ₽/л\n"
                     if "ДТ" in prices: text += f"🔹 <b>ДТ:</b> {prices['ДТ']:.2f} ₽/л\n"
 
-                # ИСПРАВЛЕНИЕ 3: история пишется в ОБЕИХ ветках (раньше — только при show_delta=True)
                 save_today_fuel(prices.get("АИ-92"), prices.get("АИ-95"), prices.get("ДТ"))
                 return text
     except Exception: return "⚠️ Ошибка сети при запросе цен."
@@ -499,23 +494,18 @@ def classify_event_and_impact(text, city=None):
     return "📝 <b>Дорожная информация:</b>", "🟢 <b>Низкое.</b> Примите к сведению.", False
 
 def get_news_core(text):
-    """Создает уникальный отпечаток события (город + улица + тип события)"""
     lower = text.lower()
     loc = extract_location(lower)
     street = extract_street(lower)
     header = classify_event_and_impact(lower)[0]
-    
     core = []
     if loc["city"]: core.append(loc["city"])
     if loc["district"]: core.append(loc["district"])
     if street: core.append(street)
     core.append(header)
-    
-    # Если не удалось вытащить улицу/город, берем первые 5 значимых слов
     if len(core) < 2:
         words = re.findall(r'\b[а-яА-ЯёЁ]{5,}\b', lower)
         core.extend(words[:5])
-        
     return generate_hash("_".join(core))
 
 # =====================================================================
@@ -588,24 +578,16 @@ async def fetch_vk(session, group_url):
     return items
 
 # =====================================================================
-#                           СВОДКА ПО ДОРОГАМ
+#                    КЭШИРОВАНИЕ И СВОДКА (ЯДРО ОПТИМИЗАЦИИ)
 # =====================================================================
-def is_duplicate_text(text1, text2, threshold=0.65):
-    """Умная проверка на дубли с использованием SequenceMatcher"""
-    t1 = re.sub(r'[^\w\s]', '', text1.lower())
-    t2 = re.sub(r'[^\w\s]', '', text2.lower())
-    
-    # Быстрая проверка на точное совпадение или полное вхождение
-    if t1 in t2 or t2 in t1: return True
-    
-    # Сравнение схожести текста
-    seq = difflib.SequenceMatcher(None, t1, t2)
-    return seq.ratio() > threshold
+_events_cache = {"ts": 0.0, "data": []}
 
-async def get_traffic_summary(user_id, user_cities, mark_seen=True):
-    cleanup_old_news()
+async def fetch_all_events():
+    """Парсит все источники ОДИН раз в 5 минут и отдает из кэша"""
+    if time.time() - _events_cache["ts"] < 300:
+        return [dict(e) for e in _events_cache["data"]]
+        
     all_news = []
-    
     async with aiohttp.ClientSession() as session:
         tasks = []
         for url in RSS_SOURCES: tasks.append(fetch_rss(session, url))
@@ -615,11 +597,26 @@ async def get_traffic_summary(user_id, user_cities, mark_seen=True):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
             if isinstance(res, list): all_news.extend(res)
+            
+    _events_cache["ts"] = time.time()
+    _events_cache["data"] = all_news
+    return [dict(e) for e in all_news]
+
+def is_duplicate_text(text1, text2, threshold=0.65):
+    t1 = re.sub(r'[^\w\s]', '', text1.lower())
+    t2 = re.sub(r'[^\w\s]', '', text2.lower())
+    if t1 in t2 or t2 in t1: return True
+    seq = difflib.SequenceMatcher(None, t1, t2)
+    return seq.ratio() > threshold
+
+async def get_traffic_summary(user_id, user_cities, mark_seen=True):
+    # 1. Берем новости из кэша (или парсим, если кэш устарел)
+    all_news = await fetch_all_events()
 
     if not all_news: 
         return "✅ <b>Свежих сообщений о ДТП нет (за сегодня и вчера).</b>"
         
-    # 1. Дедупликация внутри пачки (Fuzzy)
+    # 2. Дедупликация
     unique_news = []
     for news in all_news:
         is_dup = False
@@ -632,6 +629,7 @@ async def get_traffic_summary(user_id, user_cities, mark_seen=True):
     filtered_news = []
     jam_streets = set()
     
+    # 3. Фильтрация под конкретного пользователя
     for news in unique_news:
         header, impact_text, is_high = classify_event_and_impact(news["full_text"], city=news["city"])
         news["header"] = header
@@ -646,9 +644,7 @@ async def get_traffic_summary(user_id, user_cities, mark_seen=True):
         elif "Иваново" in user_cities and f_city == "Ивановская область": show = True
             
         if show:
-            # Используем "ядро" новости для проверки в БД
             news_core_hash = get_news_core(news["full_text"])
-            
             if not is_news_seen(user_id, news_core_hash):
                 filtered_news.append(news)
                 if is_high or "затор" in news["full_text"].lower() or "пробка" in news["full_text"].lower():
@@ -664,7 +660,7 @@ async def get_traffic_summary(user_id, user_cities, mark_seen=True):
     else:
         text += f"📊 Уровень пробок: <b>Свободно</b>\n\n"
     
-    for news in filtered_news[:15]: # Увеличили до 15 новостей
+    for news in filtered_news[:15]:
         body_text = news["full_text"]
         if body_text: body_text = body_text[0].upper() + body_text[1:]
         street = extract_street(body_text)
@@ -743,7 +739,6 @@ async def calculate_and_send_route(user_id, start_point, end_point, send_func):
         f"🚦 <b>Трафик:</b> {'Есть ДТП, возможны задержки (+10 мин)' if time_penalty else 'Свободно'}\n"
         f"{camera_warning}"
     )
-    # ИСПРАВЛЕНИЕ 4: слаг вместо сырых адресов в callback_data (пробелы/запятые ломали кнопку)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💾 Сохранить маршрут", callback_data=f"save_route_{slug(start_point)}_{slug(end_point)}")]])
     await wait_msg.edit_text(result_text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -755,9 +750,14 @@ async def broadcast_job():
     users = get_users_for_broadcast(current_time)
     if not users: return
 
+    # 1. Сначала собираем данные ОДИН раз
     weather_text, is_bad = await get_weather_ivanovo()
     fuel_text = await get_fuel_prices(show_delta=True)
     
+    # Предварительно прогреваем кэш новостей
+    await fetch_all_events()
+    
+    # 2. Рассылаем пользователям (данные уже в кэше)
     for user_id in users:
         user_cities = get_user_cities(user_id)
         traffic_text = await get_traffic_summary(user_id, user_cities)
@@ -953,7 +953,6 @@ async def process_clear_all(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("toggle_"))
 async def process_toggle_city(callback: CallbackQuery):
-    # ИСПРАВЛЕНИЕ 4: город целиком после префикса, а не split("_")[1] (иначе «Посад» терялся)
     city = callback.data[7:].replace("_", " ")
     user_cities = get_user_cities(callback.from_user.id)
     if city in user_cities: user_cities.remove(city)
@@ -967,11 +966,18 @@ async def process_save_settings(callback: CallbackQuery):
     await callback.message.edit_text("✅ Настройки городов сохранены!")
     await callback.answer()
 
+# =====================================================================
+#                           ЗАПУСК
+# =====================================================================
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK_TZ)
+    # Рассылка проверяется каждую минуту
     scheduler.add_job(broadcast_job, trigger='cron', minute='*')
+    # Очистка старой базы (кэша прочитанных) раз в сутки в 03:00 ночи
+    scheduler.add_job(cleanup_old_news, trigger='cron', hour=3, minute=0)
+    
     scheduler.start()
-    print("Бот запущен.")
+    print("Бот запущен. Кэширование и планировщик оптимизированы.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
